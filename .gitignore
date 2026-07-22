@@ -5,6 +5,7 @@ assignment1_text.txt
 /assets
 /lib
 /_build_
+/.vscode
 COMP5892M-vulkan.sln
 a12/a12.vcxproj
 a12/a12.vcxproj.user
