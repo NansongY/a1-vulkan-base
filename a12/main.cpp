@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <algorithm>
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -52,11 +53,167 @@ namespace
 			throw lut::Error( "{} returned {}", aCall, lut::to_string(aResult) );
 	}
 
+	struct Camera
+	{
+		glm::vec3 position = glm::vec3( 0.f );
+		float yaw = 0.f;    // radians, around Y
+		float pitch = 0.f;  // radians, up/down
+		float fov = glm::radians( 60.f );
+		float nearPlane = 0.1f;
+		float farPlane = 500.f;
+		float moveSpeed = 5.f;   // world units / second
+		float fastFactor = 4.f;  // Shift
+		float slowFactor = 0.2f; // Ctrl
+		float mouseSensitivity = 0.002f;
+
+		glm::vec3 front() const
+		{
+			return glm::normalize( glm::vec3(
+				std::cos( yaw ) * std::cos( pitch ),
+				std::sin( pitch ),
+				std::sin( yaw ) * std::cos( pitch )
+			) );
+		}
+
+		glm::mat4 view() const
+		{
+			return glm::lookAt( position, position + front(), glm::vec3( 0.f, 1.f, 0.f ) );
+		}
+	};
+
+	// Keyboard / mouse state, updated exclusively from GLFW callbacks
+	// (the assignment requires event-driven input, not polling).
+	struct InputState
+	{
+		bool forward = false, backward = false, left = false, right = false;
+		bool up = false, down = false;
+		bool fast = false, slow = false;
+		bool mouseLook = false;
+		bool firstMouse = true;
+		double lastX = 0.0, lastY = 0.0;
+	};
+
+	// Everything stored in the GLFW window user pointer.
+	struct ApplicationState
+	{
+		Camera camera;
+		InputState input;
+		bool framebufferResized = false;
+		double lastFrameTime = 0.0;
+	};
+
 	void framebuffer_resized_callback( GLFWwindow* aWindow, int, int )
 	{
-		auto* resized = static_cast<bool*>( glfwGetWindowUserPointer( aWindow ) );
-		if( resized )
-			*resized = true;
+		auto* app = static_cast<ApplicationState*>( glfwGetWindowUserPointer( aWindow ) );
+		if( app )
+			app->framebufferResized = true;
+	}
+
+	void key_callback( GLFWwindow* aWindow, int aKey, int, int aAction, int )
+	{
+		auto* app = static_cast<ApplicationState*>( glfwGetWindowUserPointer( aWindow ) );
+		if( !app )
+			return;
+
+		// While a key is held, GLFW sends PRESS once, then REPEAT while held,
+		// and RELEASE once when let go. Treat both PRESS and REPEAT as "held",
+		// otherwise the flag gets cleared by the first REPEAT event and the
+		// camera stops shortly after you start holding a key.
+		bool const pressed = (GLFW_PRESS == aAction || GLFW_REPEAT == aAction);
+		switch( aKey )
+		{
+			case GLFW_KEY_W: app->input.forward = pressed; break;
+			case GLFW_KEY_S: app->input.backward = pressed; break;
+			case GLFW_KEY_A: app->input.left = pressed; break;
+			case GLFW_KEY_D: app->input.right = pressed; break;
+			case GLFW_KEY_E: app->input.up = pressed; break;
+			case GLFW_KEY_Q: app->input.down = pressed; break;
+			case GLFW_KEY_LEFT_SHIFT:
+			case GLFW_KEY_RIGHT_SHIFT: app->input.fast = pressed; break;
+			case GLFW_KEY_LEFT_CONTROL:
+			case GLFW_KEY_RIGHT_CONTROL: app->input.slow = pressed; break;
+			default: break;
+		}
+	}
+
+	void mouse_button_callback( GLFWwindow* aWindow, int aButton, int aAction, int )
+	{
+		auto* app = static_cast<ApplicationState*>( glfwGetWindowUserPointer( aWindow ) );
+		if( !app )
+			return;
+
+		// Right-click toggles mouse look (click again to disable).
+		if( GLFW_MOUSE_BUTTON_RIGHT == aButton && GLFW_PRESS == aAction )
+		{
+			app->input.mouseLook = !app->input.mouseLook;
+			glfwSetInputMode( aWindow, GLFW_CURSOR, app->input.mouseLook ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL );
+			app->input.firstMouse = true;
+		}
+	}
+
+	void cursor_pos_callback( GLFWwindow* aWindow, double aX, double aY )
+	{
+		auto* app = static_cast<ApplicationState*>( glfwGetWindowUserPointer( aWindow ) );
+		if( !app || !app->input.mouseLook )
+			return;
+
+		if( app->input.firstMouse )
+		{
+			app->input.lastX = aX;
+			app->input.lastY = aY;
+			app->input.firstMouse = false;
+		}
+
+		double const dx = aX - app->input.lastX;
+		double const dy = aY - app->input.lastY;
+		app->input.lastX = aX;
+		app->input.lastY = aY;
+
+		Camera& cam = app->camera;
+		cam.yaw   += float( dx ) * cam.mouseSensitivity; // mouse right -> turn right
+		cam.pitch -= float( dy ) * cam.mouseSensitivity;
+
+		float const limit = glm::radians( 89.f );
+		cam.pitch = std::clamp( cam.pitch, -limit, limit );
+	}
+
+	// Moves the camera from the (event-driven) input state, frame-rate independent.
+	void update_camera( ApplicationState& aApp )
+	{
+		Camera& cam = aApp.camera;
+		InputState const& input = aApp.input;
+
+		double const now = glfwGetTime();
+		float const deltaTime = float( now - aApp.lastFrameTime );
+		aApp.lastFrameTime = now;
+		if( deltaTime <= 0.f )
+			return;
+		// Clamp dt so one slow frame can never cause a big jump; this keeps
+		// movement continuous and frame-rate independent even at low FPS.
+		float const dt = std::min( deltaTime, 0.05f );
+
+		float speed = cam.moveSpeed;
+		if( input.fast )
+			speed *= cam.fastFactor;
+		if( input.slow )
+			speed *= cam.slowFactor;
+
+		glm::vec3 const front = cam.front();
+		glm::vec3 const horizontalFront = glm::normalize( glm::vec3( front.x, 0.f, front.z ) );
+		glm::vec3 const right = glm::normalize( glm::cross( front, glm::vec3(0.f,1.f,0.f) ) );
+
+		glm::vec3 move( 0.f );
+		if( input.forward ) move += horizontalFront;
+		if( input.backward ) move -= horizontalFront;
+		if( input.right ) move += right;
+		if( input.left ) move -= right;
+		if( input.up ) move += glm::vec3(0.f,1.f,0.f);
+		if( input.down ) move -= glm::vec3(0.f,1.f,0.f);
+
+		if( glm::dot( move, move ) > 0.f )
+			move = glm::normalize( move );
+
+		cam.position += move * speed * dt;
 	}
 
 	void transition_image_layout( VkCommandBuffer aCmd, VkImage aImage, VkImageLayout aOldLayout, VkImageLayout aNewLayout, VkPipelineStageFlags2 aSrcStage, VkAccessFlags2 aSrcAccess, VkPipelineStageFlags2 aDstStage, VkAccessFlags2 aDstAccess, VkImageAspectFlags aAspect = VK_IMAGE_ASPECT_COLOR_BIT )
@@ -523,7 +680,7 @@ namespace
 			aRenderFinished.emplace_back( lut::create_semaphore( aWindow.device ) );
 	}
 
-	void draw_frame( lut::VulkanWindow& aWindow, VkCommandBuffer aCmd, SceneResources& aResources, lut::Allocator const& aAllocator, VkCommandPool aCmdPool, lut::Semaphore const& aImageAvailable, std::vector<lut::Semaphore>& aRenderFinished, lut::Fence const& aInFlight, std::vector<VkImageLayout>& aSwapImageLayouts, bool& aFramebufferResized )
+	void draw_frame( lut::VulkanWindow& aWindow, VkCommandBuffer aCmd, SceneResources& aResources, lut::Allocator const& aAllocator, VkCommandPool aCmdPool, lut::Semaphore const& aImageAvailable, std::vector<lut::Semaphore>& aRenderFinished, lut::Fence const& aInFlight, std::vector<VkImageLayout>& aSwapImageLayouts, ApplicationState& aAppState )
 	{
 		throw_if_failed( vkWaitForFences( aWindow.device, 1, &aInFlight.handle, VK_TRUE, kFenceTimeout ), "vkWaitForFences()" );
 
@@ -541,6 +698,24 @@ namespace
 			throw lut::Error( "vkAcquireNextImageKHR() returned {}", lut::to_string(acquireRes) );
 
 		throw_if_failed( vkResetFences( aWindow.device, 1, &aInFlight.handle ), "vkResetFences()" );
+
+		// Per-frame UBO: view-projection from the current camera.
+		{
+			Camera const& cam = aAppState.camera;
+			float const aspect = float( aWindow.swapchainExtent.width ) / float( aWindow.swapchainExtent.height );
+			glm::mat4 proj = glm::perspective( cam.fov, aspect, cam.nearPlane, cam.farPlane );
+			proj[1][1] *= -1.f; // Vulkan NDC has a flipped Y axis
+
+			SceneUBO ubo{};
+			ubo.viewProj = proj * cam.view();
+
+			void* data = nullptr;
+			throw_if_failed( vmaMapMemory( aAllocator.allocator, aResources.uboBuffer.allocation, &data ), "vmaMapMemory()" );
+			std::memcpy( data, &ubo, sizeof(ubo) );
+			vmaUnmapMemory( aAllocator.allocator, aResources.uboBuffer.allocation );
+			vmaFlushAllocation( aAllocator.allocator, aResources.uboBuffer.allocation, 0, VK_WHOLE_SIZE );
+		}
+
 		record_draw_commands( aWindow, aCmd, imageIndex, aSwapImageLayouts[imageIndex], aResources );
 		aSwapImageLayouts[imageIndex] = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
@@ -578,9 +753,9 @@ namespace
 		presentInfo.pImageIndices = &imageIndex;
 
 		auto const presentRes = vkQueuePresentKHR( aWindow.presentQueue, &presentInfo );
-		if( VK_ERROR_OUT_OF_DATE_KHR == presentRes || VK_SUBOPTIMAL_KHR == presentRes || VK_SUBOPTIMAL_KHR == acquireRes || aFramebufferResized )
+		if( VK_ERROR_OUT_OF_DATE_KHR == presentRes || VK_SUBOPTIMAL_KHR == presentRes || VK_SUBOPTIMAL_KHR == acquireRes || aAppState.framebufferResized )
 		{
-			aFramebufferResized = false;
+			aAppState.framebufferResized = false;
 			lut::recreate_swapchain( aWindow );
 			create_depth_resources( aWindow, aAllocator, aCmdPool, aResources.depthImage, aResources.depthView );
 			reset_swapchain_frame_resources( aWindow, aSwapImageLayouts, aRenderFinished );
@@ -599,9 +774,15 @@ int main() try
 {
 	auto window = lut::make_vulkan_window();
 
-	bool framebufferResized = false;
-	glfwSetWindowUserPointer( window.window, &framebufferResized );
+	// Application state (camera + input) lives in the window user pointer so
+	// the GLFW callbacks can reach it.
+	ApplicationState app;
+	app.lastFrameTime = glfwGetTime();
+	glfwSetWindowUserPointer( window.window, &app );
 	glfwSetFramebufferSizeCallback( window.window, framebuffer_resized_callback );
+	glfwSetKeyCallback( window.window, key_callback );
+	glfwSetMouseButtonCallback( window.window, mouse_button_callback );
+	glfwSetCursorPosCallback( window.window, cursor_pos_callback );
 
 	auto allocator = lut::create_allocator( window );
 
@@ -654,8 +835,7 @@ int main() try
 	resources.sampler = create_texture_sampler( window.device );
 	std::print( "Loaded {} textures\n", resources.textures.size() );
 
-	// 4) Aim a static camera at the scene using the model's bounding box, so
-	//    the model is visible without any user input yet.
+	// 4) Initial camera: aim at the scene using the model's bounding box.
 	glm::vec3 aabbMin( std::numeric_limits<float>::max() );
 	glm::vec3 aabbMax( std::numeric_limits<float>::lowest() );
 	for( auto const& mesh : model.meshes )
@@ -667,15 +847,18 @@ int main() try
 
 	glm::vec3 const center = (aabbMin + aabbMax) * 0.5f;
 	float const radius = glm::length( aabbMax - aabbMin ) * 0.5f;
-	float const fov = glm::radians( 60.f );
-	float const distance = radius / std::tan( fov * 0.5f ) * 1.6f;
-	float const aspect = float(window.swapchainExtent.width) / float(window.swapchainExtent.height);
 
-	glm::mat4 const view = glm::lookAt( center + glm::vec3( 0.f, radius*0.5f, distance ), center, glm::vec3(0.f,1.f,0.f) );
-	glm::mat4 proj = glm::perspective( fov, aspect, 0.1f, distance + radius*4.f );
-	proj[1][1] *= -1.f; // Vulkan NDC has a flipped Y axis (see the "inverted triangle" discussion)
+	Camera& camera = app.camera;
+	camera.position = center + glm::vec3( 0.f, radius*0.5f, radius / std::tan( camera.fov*0.5f ) * 1.6f );
+	camera.farPlane = glm::length( center - camera.position ) + radius*4.f;
+	camera.moveSpeed = std::max( 1.f, radius * 0.1f ); // cross the scene in ~5s at shift speed
 
-	// 5) Per-frame UBO holding the view-projection matrix.
+	// Aim the initial view direction at the scene center (derive yaw/pitch).
+	glm::vec3 const dir = glm::normalize( center - camera.position );
+	camera.yaw = std::atan2( dir.z, dir.x );
+	camera.pitch = std::asin( dir.y );
+
+	// 5) Per-frame UBO buffer (contents are written every frame in draw_frame).
 	resources.uboBuffer = lut::create_buffer(
 		allocator,
 		sizeof(SceneUBO),
@@ -683,15 +866,6 @@ int main() try
 		VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
 		VMA_MEMORY_USAGE_AUTO
 	);
-	{
-		SceneUBO ubo{};
-		ubo.viewProj = proj * view;
-		void* data = nullptr;
-		throw_if_failed( vmaMapMemory( allocator.allocator, resources.uboBuffer.allocation, &data ), "vmaMapMemory()" );
-		std::memcpy( data, &ubo, sizeof(ubo) );
-		vmaUnmapMemory( allocator.allocator, resources.uboBuffer.allocation );
-		vmaFlushAllocation( allocator.allocator, resources.uboBuffer.allocation, 0, VK_WHOLE_SIZE );
-	}
 
 	// 6) Descriptor sets + pipeline layout.
 	//    set 0: per-frame UBO (uniform buffer, vertex stage)
@@ -822,7 +996,8 @@ int main() try
 	while( !glfwWindowShouldClose( window.window ) )
 	{
 		glfwPollEvents();
-		draw_frame( window, commandBuffer, resources, allocator, commandPool.handle, imageAvailable, renderFinished, inFlight, swapImageLayouts, framebufferResized );
+		update_camera( app );
+		draw_frame( window, commandBuffer, resources, allocator, commandPool.handle, imageAvailable, renderFinished, inFlight, swapImageLayouts, app );
 	}
 
 	throw_if_failed( vkDeviceWaitIdle( window.device ), "vkDeviceWaitIdle()" );
