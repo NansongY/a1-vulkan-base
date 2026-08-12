@@ -7,6 +7,7 @@ layout(location = 2) in vec2 aUV;
 layout(set = 0, binding = 0) uniform SceneUBO
 {
 	mat4 viewProj;
+	vec4 params; // x = near, y = far, z = renderMode (unused here)
 } ubo;
 
 layout(location = 0) out vec2 vUV;

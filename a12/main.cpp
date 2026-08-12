@@ -100,6 +100,7 @@ namespace
 		InputState input;
 		bool framebufferResized = false;
 		double lastFrameTime = 0.0;
+		int renderMode = 1; // 1 = default, 2..4 = debug visualizations
 	};
 
 	void framebuffer_resized_callback( GLFWwindow* aWindow, int, int )
@@ -132,6 +133,11 @@ namespace
 			case GLFW_KEY_RIGHT_SHIFT: app->input.fast = pressed; break;
 			case GLFW_KEY_LEFT_CONTROL:
 			case GLFW_KEY_RIGHT_CONTROL: app->input.slow = pressed; break;
+			// Task 1.4: main number keys switch the rendering mode (1..4).
+			case GLFW_KEY_1: case GLFW_KEY_2: case GLFW_KEY_3: case GLFW_KEY_4:
+				if( pressed )
+					app->renderMode = aKey - GLFW_KEY_1 + 1;
+				break;
 			default: break;
 		}
 	}
@@ -264,6 +270,14 @@ namespace
 	struct SceneUBO
 	{
 		glm::mat4 viewProj;
+		glm::vec4 params; // x = near, y = far, z = renderMode
+	};
+
+	// A linked vertex + fragment shader pair.
+	struct ShaderPair
+	{
+		lut::Shader vertex;
+		lut::Shader fragment;
 	};
 
 	// Resources that survive across frames.
@@ -285,8 +299,8 @@ namespace
 		lut::Image depthImage;
 		lut::ImageView depthView;
 
-		lut::Shader vertexShader;
-		lut::Shader fragmentShader;
+		ShaderPair mainShaders;   // default.vert + default.frag (mode 1)
+		ShaderPair debugShaders;  // default.vert + debug.frag (modes 2..4)
 	};
 
 	// Creates the vertex and fragment shader objects (VK_EXT_shader_object).
@@ -298,7 +312,7 @@ namespace
 	// aSet0/aSet1 are the two descriptor set layouts used by the shaders
 	// (set 0 = UBO, set 1 = material texture). Both stages must be created
 	// with identical set-layout arrays (VUID-vkCmdDrawIndexed-None-08879).
-	void create_shader_objects( VkDevice aDevice, std::vector<std::uint32_t> const& aVertCode, std::vector<std::uint32_t> const& aFragCode, VkDescriptorSetLayout aSet0, VkDescriptorSetLayout aSet1, SceneResources& aOut )
+	ShaderPair create_shader_pair( VkDevice aDevice, std::vector<std::uint32_t> const& aVertCode, std::vector<std::uint32_t> const& aFragCode, VkDescriptorSetLayout aSet0, VkDescriptorSetLayout aSet1 )
 	{
 		VkDescriptorSetLayout const setLayouts[2] = { aSet0, aSet1 };
 
@@ -328,8 +342,7 @@ namespace
 
 		VkShaderEXT shaders[2]{};
 		throw_if_failed( vkCreateShadersEXT( aDevice, 2, infos, nullptr, shaders ), "vkCreateShadersEXT()" );
-		aOut.vertexShader = lut::Shader( aDevice, shaders[0] );
-		aOut.fragmentShader = lut::Shader( aDevice, shaders[1] );
+		return { lut::Shader( aDevice, shaders[0] ), lut::Shader( aDevice, shaders[1] ) };
 	}
 
 	// Trilinear sampler (min/mag = LINEAR, mipmap = LINEAR) for the textures.
@@ -448,7 +461,7 @@ namespace
 		return deviceBuffer;
 	}
 
-	void record_draw_commands( lut::VulkanWindow const& aWindow, VkCommandBuffer aCmd, std::uint32_t aImageIndex, VkImageLayout aOldLayout, SceneResources const& aResources )
+	void record_draw_commands( lut::VulkanWindow const& aWindow, VkCommandBuffer aCmd, std::uint32_t aImageIndex, VkImageLayout aOldLayout, SceneResources const& aResources, int aRenderMode )
 	{
 		throw_if_failed( vkResetCommandBuffer( aCmd, 0 ), "vkResetCommandBuffer()" );
 
@@ -520,8 +533,14 @@ namespace
 		vkCmdSetCullMode( aCmd, VK_CULL_MODE_NONE );
 		vkCmdSetFrontFace( aCmd, VK_FRONT_FACE_COUNTER_CLOCKWISE );
 		vkCmdSetPrimitiveTopology( aCmd, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST );
-		vkCmdSetDepthTestEnable( aCmd, VK_FALSE );
-		vkCmdSetDepthWriteEnable( aCmd, VK_FALSE );
+		// Enable depth testing/writing against the bound depth attachment.
+		// With shader objects the compare op is ALSO dynamic state -- set it to
+		// LESS explicitly (depth buffer is cleared to 1.0 == "far" each frame),
+		// otherwise the default compare op can reject every fragment.
+		vkCmdSetDepthCompareOp( aCmd, VK_COMPARE_OP_LESS );
+		vkCmdSetDepthTestEnable( aCmd, VK_TRUE );
+		vkCmdSetDepthWriteEnable( aCmd, VK_TRUE );
+		vkCmdSetDepthBoundsTestEnable( aCmd, VK_FALSE );
 		vkCmdSetStencilTestEnable( aCmd, VK_FALSE );
 		vkCmdSetDepthBiasEnable( aCmd, VK_FALSE );
 		vkCmdSetPrimitiveRestartEnable( aCmd, VK_FALSE );
@@ -576,9 +595,10 @@ namespace
 		VkColorComponentFlags const colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
 		vkCmdSetColorWriteMaskEXT( aCmd, 0, 1, &colorWriteMask );
 
-		// Bind the linked vertex + fragment shader objects.
+		// Bind either the main or the debug (Task 1.4) shader pair.
+		ShaderPair const& pair = (aRenderMode > 1) ? aResources.debugShaders : aResources.mainShaders;
 		VkShaderStageFlagBits stages[] = { VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT };
-		VkShaderEXT shaders[] = { aResources.vertexShader.handle, aResources.fragmentShader.handle };
+		VkShaderEXT shaders[] = { pair.vertex.handle, pair.fragment.handle };
 		vkCmdBindShadersEXT( aCmd, 2, stages, shaders );
 
 		// Bind the per-frame UBO (descriptor set 0) through the pipeline layout.
@@ -708,6 +728,7 @@ namespace
 
 			SceneUBO ubo{};
 			ubo.viewProj = proj * cam.view();
+			ubo.params = glm::vec4( cam.nearPlane, cam.farPlane, float( aAppState.renderMode ), 0.f );
 
 			void* data = nullptr;
 			throw_if_failed( vmaMapMemory( aAllocator.allocator, aResources.uboBuffer.allocation, &data ), "vmaMapMemory()" );
@@ -716,7 +737,7 @@ namespace
 			vmaFlushAllocation( aAllocator.allocator, aResources.uboBuffer.allocation, 0, VK_WHOLE_SIZE );
 		}
 
-		record_draw_commands( aWindow, aCmd, imageIndex, aSwapImageLayouts[imageIndex], aResources );
+		record_draw_commands( aWindow, aCmd, imageIndex, aSwapImageLayouts[imageIndex], aResources, aAppState.renderMode );
 		aSwapImageLayouts[imageIndex] = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
 		VkSemaphoreSubmitInfo waitInfo{};
@@ -874,7 +895,9 @@ int main() try
 	uboBinding.binding = 0;
 	uboBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 	uboBinding.descriptorCount = 1;
-	uboBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+	// Used by the vertex shader (viewProj) AND the debug fragment shader
+	// (near/far/renderMode), so expose it to both stages.
+	uboBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
 	VkDescriptorSetLayoutCreateInfo uboLayoutInfo{};
 	uboLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -981,10 +1004,15 @@ int main() try
 	throw_if_failed( vkCreatePipelineLayout( window.device, &plInfo, nullptr, &pl ), "vkCreatePipelineLayout()" );
 	resources.pipelineLayout = lut::PipelineLayout( window.device, pl );
 
-	// 7) Load shaders and create the shader objects (set 0 = UBO, set 1 = texture).
+	// 7) Load shaders and create the shader pairs (set 0 = UBO, set 1 = texture).
 	auto const vertCode = lut::load_file_u32( "assets/a12/shaders/default.vert.spv" );
 	auto const fragCode = lut::load_file_u32( "assets/a12/shaders/default.frag.spv" );
-	create_shader_objects( window.device, vertCode, fragCode, uboLayout, matLayout, resources );
+	resources.mainShaders = create_shader_pair( window.device, vertCode, fragCode, uboLayout, matLayout );
+
+	// Task 1.4: a second, independent shader pair for debug visualization
+	// (same vertex shader, separate debug.frag -- not part of the main shader).
+	auto const debugFragCode = lut::load_file_u32( "assets/a12/shaders/debug.frag.spv" );
+	resources.debugShaders = create_shader_pair( window.device, vertCode, debugFragCode, uboLayout, matLayout );
 
 	// 8) Depth buffer sized to the swapchain.
 	create_depth_resources( window, allocator, commandPool.handle, resources.depthImage, resources.depthView );
