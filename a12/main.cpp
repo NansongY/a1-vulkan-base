@@ -266,11 +266,16 @@ namespace
 		std::uint32_t materialId = 0;
 	};
 
-	// Per-frame scene data passed to the vertex shader.
+	// Per-frame scene data passed to the vertex AND fragment shaders (Task 1.5
+	// PBR lighting data). Everything is a vec4 so the std140 layout is trivial.
 	struct SceneUBO
 	{
-		glm::mat4 viewProj;
-		glm::vec4 params; // x = near, y = far, z = renderMode
+		glm::mat4 viewProj;     // offset 0
+		glm::vec4 params;       // offset 64: x = near, y = far, z = renderMode
+		glm::vec4 cameraPos;    // offset 80: camera position (world space)
+		glm::vec4 lightPos;     // offset 96: light position (world space)
+		glm::vec4 lightColor;   // offset 112: light color
+		glm::vec4 ambientColor; // offset 128: ambient light color
 	};
 
 	// A linked vertex + fragment shader pair.
@@ -729,6 +734,12 @@ namespace
 			SceneUBO ubo{};
 			ubo.viewProj = proj * cam.view();
 			ubo.params = glm::vec4( cam.nearPlane, cam.farPlane, float( aAppState.renderMode ), 0.f );
+			// Task 1.5: PBR lighting data. Passed via the UBO (not hard-coded in
+			// the shaders); the light position/color follow the assignment.
+			ubo.cameraPos = glm::vec4( cam.position, 1.f );
+			ubo.lightPos = glm::vec4( -0.2972f, 7.3100f, -11.9532f, 1.f );
+			ubo.lightColor = glm::vec4( 1.f, 1.f, 1.f, 1.f );
+			ubo.ambientColor = glm::vec4( 0.02f, 0.02f, 0.02f, 1.f );
 
 			void* data = nullptr;
 			throw_if_failed( vmaMapMemory( aAllocator.allocator, aResources.uboBuffer.allocation, &data ), "vmaMapMemory()" );
@@ -908,16 +919,26 @@ int main() try
 	throw_if_failed( vkCreateDescriptorSetLayout( window.device, &uboLayoutInfo, nullptr, &uboLayout ), "vkCreateDescriptorSetLayout()" );
 	resources.uboSetLayout = lut::DescriptorSetLayout( window.device, uboLayout );
 
-	VkDescriptorSetLayoutBinding texBinding{};
-	texBinding.binding = 0;
-	texBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	texBinding.descriptorCount = 1;
-	texBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+	// Task 1.5: the material set now exposes three textures -- base color
+	// (binding 0), roughness (binding 1) and metalness (binding 2).
+	VkDescriptorSetLayoutBinding texBindings[3]{};
+	texBindings[0].binding = 0;
+	texBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	texBindings[0].descriptorCount = 1;
+	texBindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+	texBindings[1].binding = 1;
+	texBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	texBindings[1].descriptorCount = 1;
+	texBindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+	texBindings[2].binding = 2;
+	texBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	texBindings[2].descriptorCount = 1;
+	texBindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
 	VkDescriptorSetLayoutCreateInfo matLayoutInfo{};
 	matLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	matLayoutInfo.bindingCount = 1;
-	matLayoutInfo.pBindings = &texBinding;
+	matLayoutInfo.bindingCount = 3;
+	matLayoutInfo.pBindings = texBindings;
 
 	VkDescriptorSetLayout matLayout = VK_NULL_HANDLE;
 	throw_if_failed( vkCreateDescriptorSetLayout( window.device, &matLayoutInfo, nullptr, &matLayout ), "vkCreateDescriptorSetLayout()" );
@@ -930,7 +951,7 @@ int main() try
 	poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 	poolSizes[0].descriptorCount = 1;
 	poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	poolSizes[1].descriptorCount = materialCount;
+	poolSizes[1].descriptorCount = 3 * materialCount; // baseColor + roughness + metalness
 
 	VkDescriptorPoolCreateInfo poolInfo{};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -963,8 +984,10 @@ int main() try
 	write.pBufferInfo = &uboInfo;
 	vkUpdateDescriptorSets( window.device, 1, &write, 0, nullptr );
 
-	// Allocate + write one texture set per material (set 1), pointing at the
-	// material's base color texture.
+	// Allocate + write one texture set per material (set 1): base color,
+	// roughness and metalness. If a material lacks a roughness/metalness map
+	// (index 0xffffffff), fall back to its base color texture so every
+	// descriptor references a valid image view.
 	resources.materialSets.resize( materialCount );
 	for( std::uint32_t m = 0; m < materialCount; ++m )
 	{
@@ -975,21 +998,35 @@ int main() try
 		matAllocInfo.pSetLayouts = &matLayout;
 		throw_if_failed( vkAllocateDescriptorSets( window.device, &matAllocInfo, &resources.materialSets[m] ), "vkAllocateDescriptorSets()" );
 
+		auto const fallbackId = [&model]( std::uint32_t aId, std::uint32_t aBaseId ) -> std::uint32_t
+		{
+			return (0xffffffffu == aId) ? aBaseId : aId;
+		};
 		std::uint32_t const baseColorId = model.materials[m].baseColorTextureId;
+		std::uint32_t const roughId = fallbackId( model.materials[m].roughnessTextureId, baseColorId );
+		std::uint32_t const metalId = fallbackId( model.materials[m].metalnessTextureId, baseColorId );
 
-		VkDescriptorImageInfo imgInfo{};
-		imgInfo.sampler = resources.sampler.handle;
-		imgInfo.imageView = resources.textureViews[baseColorId].handle;
-		imgInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		VkDescriptorImageInfo imgInfos[3]{};
+		for( auto& ii : imgInfos )
+		{
+			ii.sampler = resources.sampler.handle;
+			ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		}
+		imgInfos[0].imageView = resources.textureViews[baseColorId].handle;
+		imgInfos[1].imageView = resources.textureViews[roughId].handle;
+		imgInfos[2].imageView = resources.textureViews[metalId].handle;
 
-		VkWriteDescriptorSet matWrite{};
-		matWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-		matWrite.dstSet = resources.materialSets[m];
-		matWrite.dstBinding = 0;
-		matWrite.descriptorCount = 1;
-		matWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-		matWrite.pImageInfo = &imgInfo;
-		vkUpdateDescriptorSets( window.device, 1, &matWrite, 0, nullptr );
+		VkWriteDescriptorSet matWrites[3]{};
+		for( std::uint32_t b = 0; b < 3; ++b )
+		{
+			matWrites[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+			matWrites[b].dstSet = resources.materialSets[m];
+			matWrites[b].dstBinding = b;
+			matWrites[b].descriptorCount = 1;
+			matWrites[b].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+			matWrites[b].pImageInfo = &imgInfos[b];
+		}
+		vkUpdateDescriptorSets( window.device, 3, matWrites, 0, nullptr );
 	}
 
 	// Pipeline layout covering both sets.
