@@ -48,7 +48,7 @@ namespace labut2
 	};
 
 
-	Image load_image_texture2d( char const* aPath, VulkanContext const&, VkCommandPool, Allocator const& );
+	Image load_image_texture2d( char const* aPath, VulkanContext const&, VkCommandPool, Allocator const&, VkFormat aFormat = VK_FORMAT_R8G8B8A8_UNORM );
 
 	Image create_image_texture2d( Allocator const&, std::uint32_t aWidth, std::uint32_t aHeight, VkFormat, VkImageUsageFlags = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT );
 

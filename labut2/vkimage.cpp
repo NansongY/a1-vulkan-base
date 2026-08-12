@@ -129,7 +129,7 @@ namespace labut2
 		return Image( aAllocator.allocator, image, allocation );
 	}
 
-	Image load_image_texture2d( char const* aPath, VulkanContext const& aContext, VkCommandPool aCmdPool, Allocator const& aAllocator )
+	Image load_image_texture2d( char const* aPath, VulkanContext const& aContext, VkCommandPool aCmdPool, Allocator const& aAllocator, VkFormat aFormat )
 	{
 		int width = 0, height = 0, channels = 0;
 		stbi_uc* const pixels = stbi_load( aPath, &width, &height, &channels, 4 ); // force RGBA
@@ -141,7 +141,7 @@ namespace labut2
 		std::unique_ptr<stbi_uc, StbiFree> const pixelGuard( pixels );
 
 		VkDeviceSize const imageSize = VkDeviceSize(width) * height * 4;
-		VkFormat const format = VK_FORMAT_R8G8B8A8_UNORM;
+		VkFormat const format = aFormat;
 
 		// 1) Upload pixels into a host-visible staging buffer.
 		Buffer staging = create_buffer(

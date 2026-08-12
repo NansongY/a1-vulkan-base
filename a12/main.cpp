@@ -114,12 +114,16 @@ namespace
 	{
 		std::vector<MeshResources> meshes;
 		std::vector<lut::Image> textures;
+		std::vector<lut::ImageView> textureViews;
+		lut::Sampler sampler;
 
 		lut::Buffer uboBuffer;
-		lut::DescriptorSetLayout descriptorSetLayout;
+		lut::DescriptorSetLayout uboSetLayout;       // set 0: per-frame UBO
+		lut::DescriptorSetLayout materialSetLayout;  // set 1: per-material texture
 		lut::DescriptorPool descriptorPool;
 		lut::PipelineLayout pipelineLayout;
 		VkDescriptorSet uboSet = VK_NULL_HANDLE;
+		std::vector<VkDescriptorSet> materialSets;
 
 		lut::Image depthImage;
 		lut::ImageView depthView;
@@ -134,9 +138,13 @@ namespace
 	// Note: this bundled header is VK_EXT_shader_object spec version 1, where
 	// vertex-input and color-blend state are NOT part of VkShaderCreateInfoEXT
 	// -- they are dynamic state that we set per command buffer instead.
-	// aUboLayout is the descriptor set layout used by the vertex shader (set 0).
-	void create_shader_objects( VkDevice aDevice, std::vector<std::uint32_t> const& aVertCode, std::vector<std::uint32_t> const& aFragCode, VkDescriptorSetLayout aUboLayout, SceneResources& aOut )
+	// aSet0/aSet1 are the two descriptor set layouts used by the shaders
+	// (set 0 = UBO, set 1 = material texture). Both stages must be created
+	// with identical set-layout arrays (VUID-vkCmdDrawIndexed-None-08879).
+	void create_shader_objects( VkDevice aDevice, std::vector<std::uint32_t> const& aVertCode, std::vector<std::uint32_t> const& aFragCode, VkDescriptorSetLayout aSet0, VkDescriptorSetLayout aSet1, SceneResources& aOut )
 	{
+		VkDescriptorSetLayout const setLayouts[2] = { aSet0, aSet1 };
+
 		VkShaderCreateInfoEXT infos[2]{};
 
 		infos[0].sType  = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT;
@@ -147,8 +155,8 @@ namespace
 		infos[0].codeSize = aVertCode.size() * sizeof(std::uint32_t);
 		infos[0].pCode = aVertCode.data();
 		infos[0].pName = "main";
-		infos[0].setLayoutCount = 1;
-		infos[0].pSetLayouts = &aUboLayout;
+		infos[0].setLayoutCount = 2;
+		infos[0].pSetLayouts = setLayouts;
 
 		infos[1].sType  = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT;
 		infos[1].flags  = VK_SHADER_CREATE_LINK_STAGE_BIT_EXT;
@@ -158,13 +166,61 @@ namespace
 		infos[1].codeSize = aFragCode.size() * sizeof(std::uint32_t);
 		infos[1].pCode = aFragCode.data();
 		infos[1].pName = "main";
-		infos[1].setLayoutCount = 1; // must match the vertex stage's set layouts
-		infos[1].pSetLayouts = &aUboLayout;
+		infos[1].setLayoutCount = 2; // must match the vertex stage's set layouts
+		infos[1].pSetLayouts = setLayouts;
 
 		VkShaderEXT shaders[2]{};
 		throw_if_failed( vkCreateShadersEXT( aDevice, 2, infos, nullptr, shaders ), "vkCreateShadersEXT()" );
 		aOut.vertexShader = lut::Shader( aDevice, shaders[0] );
 		aOut.fragmentShader = lut::Shader( aDevice, shaders[1] );
+	}
+
+	// Trilinear sampler (min/mag = LINEAR, mipmap = LINEAR) for the textures.
+	lut::Sampler create_texture_sampler( VkDevice aDevice )
+	{
+		VkSamplerCreateInfo info{};
+		info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+		info.magFilter = VK_FILTER_LINEAR;
+		info.minFilter = VK_FILTER_LINEAR;
+		info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+		info.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+		info.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+		info.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+		info.mipLodBias = 0.f;
+		info.anisotropyEnable = VK_FALSE; // disabled (assignment wants this off for the mip visualization task)
+		info.maxAnisotropy = 1.f;
+		info.compareEnable = VK_FALSE;
+		info.minLod = 0.f;
+		info.maxLod = VK_LOD_CLAMP_NONE; // clamped by each texture's own mip count
+		info.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+		info.unnormalizedCoordinates = VK_FALSE;
+
+		VkSampler sampler = VK_NULL_HANDLE;
+		throw_if_failed( vkCreateSampler( aDevice, &info, nullptr, &sampler ), "vkCreateSampler()" );
+		return lut::Sampler( aDevice, sampler );
+	}
+
+	// Full mip-chain 2D image view for a texture.
+	lut::ImageView create_texture_view( VkDevice aDevice, VkImage aImage, VkFormat aFormat )
+	{
+		VkImageViewCreateInfo info{};
+		info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		info.image = aImage;
+		info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		info.format = aFormat;
+		info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+		info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+		info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+		info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+		info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		info.subresourceRange.baseMipLevel = 0;
+		info.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS; // cover the whole mip chain
+		info.subresourceRange.baseArrayLayer = 0;
+		info.subresourceRange.layerCount = 1;
+
+		VkImageView view = VK_NULL_HANDLE;
+		throw_if_failed( vkCreateImageView( aDevice, &info, nullptr, &view ), "vkCreateImageView()" );
+		return lut::ImageView( aDevice, view );
 	}
 
 	// Submits a small one-shot command buffer (used for setup-time transfers)
@@ -371,10 +427,14 @@ namespace
 		// Bind the per-frame UBO (descriptor set 0) through the pipeline layout.
 		vkCmdBindDescriptorSets( aCmd, VK_PIPELINE_BIND_POINT_GRAPHICS, aResources.pipelineLayout.handle, 0, 1, &aResources.uboSet, 0, nullptr );
 
-		// Draw every mesh with its own vertex + index buffers (indexed drawing).
+		// Draw every mesh with its own vertex + index buffers (indexed drawing),
+		// binding the material's texture descriptor set (set 1) first.
 		VkDeviceSize offset = 0;
 		for( auto const& mesh : aResources.meshes )
 		{
+			VkDescriptorSet const materialSet = aResources.materialSets[mesh.materialId];
+			vkCmdBindDescriptorSets( aCmd, VK_PIPELINE_BIND_POINT_GRAPHICS, aResources.pipelineLayout.handle, 1, 1, &materialSet, 0, nullptr );
+
 			vkCmdBindVertexBuffers( aCmd, 0, 1, &mesh.vertexBuffer.buffer, &offset );
 			vkCmdBindIndexBuffer( aCmd, mesh.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32 );
 			vkCmdDrawIndexed( aCmd, mesh.indexCount, 1, 0, 0, 0 );
@@ -577,11 +637,21 @@ int main() try
 	}
 	std::print( "Uploaded {} meshes ({} total vertices)\n", resources.meshes.size(), model.meshes.size() );
 
-	// 3) Load every texture into GPU memory (they get bound in the next stage).
+	// 3) Load every texture into GPU memory (with a full mip chain) and create
+	//    a matching image view for each. sRGB textures get an sRGB format so
+	//    the hardware decodes them to linear when sampling.
+	resources.textures.reserve( model.textures.size() );
+	resources.textureViews.reserve( model.textures.size() );
 	for( auto const& tex : model.textures )
 	{
-		resources.textures.emplace_back( lut::load_image_texture2d( tex.path.c_str(), window, commandPool.handle, allocator ) );
+		VkFormat const format = (ETextureSpace::srgb == tex.space)
+			? VK_FORMAT_R8G8B8A8_SRGB
+			: VK_FORMAT_R8G8B8A8_UNORM;
+
+		resources.textures.emplace_back( lut::load_image_texture2d( tex.path.c_str(), window, commandPool.handle, allocator, format ) );
+		resources.textureViews.emplace_back( create_texture_view( window.device, resources.textures.back().image, format ) );
 	}
+	resources.sampler = create_texture_sampler( window.device );
 	std::print( "Loaded {} textures\n", resources.textures.size() );
 
 	// 4) Aim a static camera at the scene using the model's bounding box, so
@@ -623,36 +693,59 @@ int main() try
 		vmaFlushAllocation( allocator.allocator, resources.uboBuffer.allocation, 0, VK_WHOLE_SIZE );
 	}
 
-	// 6) Descriptor set (UBO) + pipeline layout.
+	// 6) Descriptor sets + pipeline layout.
+	//    set 0: per-frame UBO (uniform buffer, vertex stage)
+	//    set 1: per-material base color texture (combined image sampler, fragment stage)
 	VkDescriptorSetLayoutBinding uboBinding{};
 	uboBinding.binding = 0;
 	uboBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 	uboBinding.descriptorCount = 1;
 	uboBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
-	VkDescriptorSetLayoutCreateInfo layoutInfo{};
-	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-	layoutInfo.bindingCount = 1;
-	layoutInfo.pBindings = &uboBinding;
+	VkDescriptorSetLayoutCreateInfo uboLayoutInfo{};
+	uboLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	uboLayoutInfo.bindingCount = 1;
+	uboLayoutInfo.pBindings = &uboBinding;
 
 	VkDescriptorSetLayout uboLayout = VK_NULL_HANDLE;
-	throw_if_failed( vkCreateDescriptorSetLayout( window.device, &layoutInfo, nullptr, &uboLayout ), "vkCreateDescriptorSetLayout()" );
-	resources.descriptorSetLayout = lut::DescriptorSetLayout( window.device, uboLayout );
+	throw_if_failed( vkCreateDescriptorSetLayout( window.device, &uboLayoutInfo, nullptr, &uboLayout ), "vkCreateDescriptorSetLayout()" );
+	resources.uboSetLayout = lut::DescriptorSetLayout( window.device, uboLayout );
 
-	VkDescriptorPoolSize poolSize{};
-	poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-	poolSize.descriptorCount = 1;
+	VkDescriptorSetLayoutBinding texBinding{};
+	texBinding.binding = 0;
+	texBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	texBinding.descriptorCount = 1;
+	texBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+	VkDescriptorSetLayoutCreateInfo matLayoutInfo{};
+	matLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	matLayoutInfo.bindingCount = 1;
+	matLayoutInfo.pBindings = &texBinding;
+
+	VkDescriptorSetLayout matLayout = VK_NULL_HANDLE;
+	throw_if_failed( vkCreateDescriptorSetLayout( window.device, &matLayoutInfo, nullptr, &matLayout ), "vkCreateDescriptorSetLayout()" );
+	resources.materialSetLayout = lut::DescriptorSetLayout( window.device, matLayout );
+
+	// Pool: 1 UBO set + one texture set per material.
+	std::uint32_t const materialCount = std::uint32_t( model.materials.size() );
+
+	VkDescriptorPoolSize poolSizes[2]{};
+	poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	poolSizes[0].descriptorCount = 1;
+	poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	poolSizes[1].descriptorCount = materialCount;
 
 	VkDescriptorPoolCreateInfo poolInfo{};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-	poolInfo.maxSets = 1;
-	poolInfo.poolSizeCount = 1;
-	poolInfo.pPoolSizes = &poolSize;
+	poolInfo.maxSets = 1 + materialCount;
+	poolInfo.poolSizeCount = 2;
+	poolInfo.pPoolSizes = poolSizes;
 
 	VkDescriptorPool pool = VK_NULL_HANDLE;
 	throw_if_failed( vkCreateDescriptorPool( window.device, &poolInfo, nullptr, &pool ), "vkCreateDescriptorPool()" );
 	resources.descriptorPool = lut::DescriptorPool( window.device, pool );
 
+	// Allocate + write the single UBO set (set 0).
 	VkDescriptorSetAllocateInfo setAllocInfo{};
 	setAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
 	setAllocInfo.descriptorPool = pool;
@@ -673,19 +766,51 @@ int main() try
 	write.pBufferInfo = &uboInfo;
 	vkUpdateDescriptorSets( window.device, 1, &write, 0, nullptr );
 
+	// Allocate + write one texture set per material (set 1), pointing at the
+	// material's base color texture.
+	resources.materialSets.resize( materialCount );
+	for( std::uint32_t m = 0; m < materialCount; ++m )
+	{
+		VkDescriptorSetAllocateInfo matAllocInfo{};
+		matAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+		matAllocInfo.descriptorPool = pool;
+		matAllocInfo.descriptorSetCount = 1;
+		matAllocInfo.pSetLayouts = &matLayout;
+		throw_if_failed( vkAllocateDescriptorSets( window.device, &matAllocInfo, &resources.materialSets[m] ), "vkAllocateDescriptorSets()" );
+
+		std::uint32_t const baseColorId = model.materials[m].baseColorTextureId;
+
+		VkDescriptorImageInfo imgInfo{};
+		imgInfo.sampler = resources.sampler.handle;
+		imgInfo.imageView = resources.textureViews[baseColorId].handle;
+		imgInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+		VkWriteDescriptorSet matWrite{};
+		matWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		matWrite.dstSet = resources.materialSets[m];
+		matWrite.dstBinding = 0;
+		matWrite.descriptorCount = 1;
+		matWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		matWrite.pImageInfo = &imgInfo;
+		vkUpdateDescriptorSets( window.device, 1, &matWrite, 0, nullptr );
+	}
+
+	// Pipeline layout covering both sets.
+	VkDescriptorSetLayout const pipelineSetLayouts[2] = { uboLayout, matLayout };
+
 	VkPipelineLayoutCreateInfo plInfo{};
 	plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-	plInfo.setLayoutCount = 1;
-	plInfo.pSetLayouts = &uboLayout;
+	plInfo.setLayoutCount = 2;
+	plInfo.pSetLayouts = pipelineSetLayouts;
 
 	VkPipelineLayout pl = VK_NULL_HANDLE;
 	throw_if_failed( vkCreatePipelineLayout( window.device, &plInfo, nullptr, &pl ), "vkCreatePipelineLayout()" );
 	resources.pipelineLayout = lut::PipelineLayout( window.device, pl );
 
-	// 7) Load shaders and create the shader objects (vertex stage uses set 0).
+	// 7) Load shaders and create the shader objects (set 0 = UBO, set 1 = texture).
 	auto const vertCode = lut::load_file_u32( "assets/a12/shaders/default.vert.spv" );
 	auto const fragCode = lut::load_file_u32( "assets/a12/shaders/default.frag.spv" );
-	create_shader_objects( window.device, vertCode, fragCode, uboLayout, resources );
+	create_shader_objects( window.device, vertCode, fragCode, uboLayout, matLayout, resources );
 
 	// 8) Depth buffer sized to the swapchain.
 	create_depth_resources( window, allocator, commandPool.handle, resources.depthImage, resources.depthView );
