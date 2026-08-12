@@ -4,12 +4,14 @@
 #include <chrono>
 #include <limits>
 #include <vector>
+#include <utility>
 #include <stdexcept>
 
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -57,7 +59,7 @@ namespace
 			*resized = true;
 	}
 
-	void transition_image_layout( VkCommandBuffer aCmd, VkImage aImage, VkImageLayout aOldLayout, VkImageLayout aNewLayout, VkPipelineStageFlags2 aSrcStage, VkAccessFlags2 aSrcAccess, VkPipelineStageFlags2 aDstStage, VkAccessFlags2 aDstAccess )
+	void transition_image_layout( VkCommandBuffer aCmd, VkImage aImage, VkImageLayout aOldLayout, VkImageLayout aNewLayout, VkPipelineStageFlags2 aSrcStage, VkAccessFlags2 aSrcAccess, VkPipelineStageFlags2 aDstStage, VkAccessFlags2 aDstAccess, VkImageAspectFlags aAspect = VK_IMAGE_ASPECT_COLOR_BIT )
 	{
 		VkImageMemoryBarrier2 barrier{};
 		barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -70,7 +72,7 @@ namespace
 		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		barrier.image = aImage;
-		barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		barrier.subresourceRange.aspectMask = aAspect;
 		barrier.subresourceRange.baseMipLevel = 0;
 		barrier.subresourceRange.levelCount = 1;
 		barrier.subresourceRange.baseArrayLayer = 0;
@@ -84,7 +86,156 @@ namespace
 		vkCmdPipelineBarrier2( aCmd, &dependencyInfo );
 	}
 
-	void record_clear_commands( lut::VulkanWindow const& aWindow, VkCommandBuffer aCmd, std::uint32_t aImageIndex, VkImageLayout aOldLayout )
+	// Interleaved vertex format matching the baked model data.
+	struct Vertex
+	{
+		glm::vec3 pos;
+		glm::vec3 normal;
+		glm::vec2 uv;
+	};
+
+	// Per-mesh GPU buffers (one per baked mesh).
+	struct MeshResources
+	{
+		lut::Buffer vertexBuffer;
+		lut::Buffer indexBuffer;
+		std::uint32_t indexCount = 0;
+		std::uint32_t materialId = 0;
+	};
+
+	// Per-frame scene data passed to the vertex shader.
+	struct SceneUBO
+	{
+		glm::mat4 viewProj;
+	};
+
+	// Resources that survive across frames.
+	struct SceneResources
+	{
+		std::vector<MeshResources> meshes;
+		std::vector<lut::Image> textures;
+
+		lut::Buffer uboBuffer;
+		lut::DescriptorSetLayout descriptorSetLayout;
+		lut::DescriptorPool descriptorPool;
+		lut::PipelineLayout pipelineLayout;
+		VkDescriptorSet uboSet = VK_NULL_HANDLE;
+
+		lut::Image depthImage;
+		lut::ImageView depthView;
+
+		lut::Shader vertexShader;
+		lut::Shader fragmentShader;
+	};
+
+	// Creates the vertex and fragment shader objects (VK_EXT_shader_object).
+	// We use VK_SHADER_CREATE_LINK_STAGE_BIT_EXT so both stages are linked
+	// together (they must then be created in the same vkCreateShadersEXT call).
+	// Note: this bundled header is VK_EXT_shader_object spec version 1, where
+	// vertex-input and color-blend state are NOT part of VkShaderCreateInfoEXT
+	// -- they are dynamic state that we set per command buffer instead.
+	// aUboLayout is the descriptor set layout used by the vertex shader (set 0).
+	void create_shader_objects( VkDevice aDevice, std::vector<std::uint32_t> const& aVertCode, std::vector<std::uint32_t> const& aFragCode, VkDescriptorSetLayout aUboLayout, SceneResources& aOut )
+	{
+		VkShaderCreateInfoEXT infos[2]{};
+
+		infos[0].sType  = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT;
+		infos[0].flags  = VK_SHADER_CREATE_LINK_STAGE_BIT_EXT;
+		infos[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+		infos[0].nextStage = VK_SHADER_STAGE_FRAGMENT_BIT;
+		infos[0].codeType = VK_SHADER_CODE_TYPE_SPIRV_EXT;
+		infos[0].codeSize = aVertCode.size() * sizeof(std::uint32_t);
+		infos[0].pCode = aVertCode.data();
+		infos[0].pName = "main";
+		infos[0].setLayoutCount = 1;
+		infos[0].pSetLayouts = &aUboLayout;
+
+		infos[1].sType  = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT;
+		infos[1].flags  = VK_SHADER_CREATE_LINK_STAGE_BIT_EXT;
+		infos[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+		infos[1].nextStage = VkShaderStageFlagBits(0);
+		infos[1].codeType = VK_SHADER_CODE_TYPE_SPIRV_EXT;
+		infos[1].codeSize = aFragCode.size() * sizeof(std::uint32_t);
+		infos[1].pCode = aFragCode.data();
+		infos[1].pName = "main";
+		infos[1].setLayoutCount = 1; // must match the vertex stage's set layouts
+		infos[1].pSetLayouts = &aUboLayout;
+
+		VkShaderEXT shaders[2]{};
+		throw_if_failed( vkCreateShadersEXT( aDevice, 2, infos, nullptr, shaders ), "vkCreateShadersEXT()" );
+		aOut.vertexShader = lut::Shader( aDevice, shaders[0] );
+		aOut.fragmentShader = lut::Shader( aDevice, shaders[1] );
+	}
+
+	// Submits a small one-shot command buffer (used for setup-time transfers)
+	// and blocks until it has finished.
+	template< typename tRecordFn >
+	void submit_one_time( lut::VulkanWindow const& aWindow, VkCommandPool aCmdPool, tRecordFn&& aRecord )
+	{
+		auto const cmd = lut::alloc_command_buffer( aWindow, aCmdPool );
+
+		VkCommandBufferBeginInfo beginInfo{};
+		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		throw_if_failed( vkBeginCommandBuffer( cmd, &beginInfo ), "vkBeginCommandBuffer()" );
+
+		aRecord( cmd );
+
+		throw_if_failed( vkEndCommandBuffer( cmd ), "vkEndCommandBuffer()" );
+
+		VkCommandBufferSubmitInfo cmdInfo{};
+		cmdInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+		cmdInfo.commandBuffer = cmd;
+
+		VkSubmitInfo2 submitInfo{};
+		submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+		submitInfo.commandBufferInfoCount = 1;
+		submitInfo.pCommandBufferInfos = &cmdInfo;
+
+		auto fence = lut::create_fence( aWindow.device );
+		throw_if_failed( vkQueueSubmit2( aWindow.graphicsQueue, 1, &submitInfo, fence.handle ), "vkQueueSubmit2()" );
+		throw_if_failed( vkWaitForFences( aWindow.device, 1, &fence.handle, VK_TRUE, kFenceTimeout ), "vkWaitForFences()" );
+	}
+
+	// Copies data into a staging buffer and uploads it to a device-local buffer.
+	lut::Buffer upload_buffer( lut::VulkanWindow const& aWindow, lut::Allocator const& aAllocator, VkCommandPool aCmdPool, void const* aData, VkDeviceSize aSize, VkBufferUsageFlags aUsage )
+	{
+		// 1) Host-visible staging buffer filled with the data.
+		auto staging = lut::create_buffer(
+			aAllocator,
+			aSize,
+			VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+			VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+			VMA_MEMORY_USAGE_AUTO
+		);
+		{
+			void* data = nullptr;
+			throw_if_failed( vmaMapMemory( aAllocator.allocator, staging.allocation, &data ), "vmaMapMemory()" );
+			std::memcpy( data, aData, aSize );
+			vmaUnmapMemory( aAllocator.allocator, staging.allocation );
+		}
+
+		// 2) Device-local buffer that the GPU actually reads from.
+		auto deviceBuffer = lut::create_buffer(
+			aAllocator,
+			aSize,
+			aUsage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+			0,
+			VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+		);
+
+		// 3) Record a copy and wait for it to finish.
+		submit_one_time( aWindow, aCmdPool, [&]( VkCommandBuffer aCmd )
+		{
+			VkBufferCopy region{};
+			region.size = aSize;
+			vkCmdCopyBuffer( aCmd, staging.buffer, deviceBuffer.buffer, 1, &region );
+		} );
+
+		return deviceBuffer;
+	}
+
+	void record_draw_commands( lut::VulkanWindow const& aWindow, VkCommandBuffer aCmd, std::uint32_t aImageIndex, VkImageLayout aOldLayout, SceneResources const& aResources )
 	{
 		throw_if_failed( vkResetCommandBuffer( aCmd, 0 ), "vkResetCommandBuffer()" );
 
@@ -118,6 +269,15 @@ namespace
 		colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 		colorAttachment.clearValue = clearValue;
 
+		// Depth attachment (cleared to "far" = 1.0 each frame).
+		VkRenderingAttachmentInfo depthAttachment{};
+		depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+		depthAttachment.imageView = aResources.depthView.handle;
+		depthAttachment.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+		depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+		depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+		depthAttachment.clearValue.depthStencil.depth = 1.0f;
+
 		VkRenderingInfo renderingInfo{};
 		renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
 		renderingInfo.renderArea.offset = { 0, 0 };
@@ -125,8 +285,101 @@ namespace
 		renderingInfo.layerCount = 1;
 		renderingInfo.colorAttachmentCount = 1;
 		renderingInfo.pColorAttachments = &colorAttachment;
+		renderingInfo.pDepthAttachment = &depthAttachment;
 
 		vkCmdBeginRendering( aCmd, &renderingInfo );
+
+		// With shader objects, viewport/scissor/topology are dynamic state:
+		// we have to set them explicitly before drawing.
+		VkViewport viewport{};
+		viewport.width = static_cast<float>( aWindow.swapchainExtent.width );
+		viewport.height = static_cast<float>( aWindow.swapchainExtent.height );
+		viewport.maxDepth = 1.f;
+		vkCmdSetViewportWithCount( aCmd, 1, &viewport );
+
+		VkRect2D scissor{};
+		scissor.extent = aWindow.swapchainExtent;
+		vkCmdSetScissorWithCount( aCmd, 1, &scissor );
+
+		// With shader objects, all these rasterization states are dynamic and
+		// must be set explicitly before drawing (v1 VK_EXT_shader_object).
+		vkCmdSetRasterizerDiscardEnable( aCmd, VK_FALSE );
+		vkCmdSetCullMode( aCmd, VK_CULL_MODE_NONE );
+		vkCmdSetFrontFace( aCmd, VK_FRONT_FACE_COUNTER_CLOCKWISE );
+		vkCmdSetPrimitiveTopology( aCmd, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST );
+		vkCmdSetDepthTestEnable( aCmd, VK_FALSE );
+		vkCmdSetDepthWriteEnable( aCmd, VK_FALSE );
+		vkCmdSetStencilTestEnable( aCmd, VK_FALSE );
+		vkCmdSetDepthBiasEnable( aCmd, VK_FALSE );
+		vkCmdSetPrimitiveRestartEnable( aCmd, VK_FALSE );
+		vkCmdSetPolygonModeEXT( aCmd, VK_POLYGON_MODE_FILL );
+		vkCmdSetRasterizationSamplesEXT( aCmd, VK_SAMPLE_COUNT_1_BIT );
+		VkSampleMask const sampleMask = 0x1;
+		vkCmdSetSampleMaskEXT( aCmd, VK_SAMPLE_COUNT_1_BIT, &sampleMask );
+		vkCmdSetAlphaToCoverageEnableEXT( aCmd, VK_FALSE );
+
+		// Vertex input is dynamic state with (v1) shader objects.
+		VkVertexInputBindingDescription2EXT binding{};
+		binding.sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT;
+		binding.binding = 0;
+		binding.stride = sizeof(Vertex);
+		binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+		binding.divisor = 1; // required (divisor 0 needs a separate feature)
+
+		VkVertexInputAttributeDescription2EXT attribs[3]{};
+		attribs[0].sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT;
+		attribs[0].location = 0;
+		attribs[0].binding = 0;
+		attribs[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+		attribs[0].offset = offsetof(Vertex, pos);
+
+		attribs[1].sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT;
+		attribs[1].location = 1;
+		attribs[1].binding = 0;
+		attribs[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+		attribs[1].offset = offsetof(Vertex, normal);
+
+		attribs[2].sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT;
+		attribs[2].location = 2;
+		attribs[2].binding = 0;
+		attribs[2].format = VK_FORMAT_R32G32_SFLOAT; // vec2
+		attribs[2].offset = offsetof(Vertex, uv);
+
+		vkCmdSetVertexInputEXT( aCmd, 1, &binding, 3, attribs );
+
+		// Color blend is dynamic state with (v1) shader objects.
+		VkBool32 const colorBlendEnable = VK_FALSE;
+		vkCmdSetColorBlendEnableEXT( aCmd, 0, 1, &colorBlendEnable );
+
+		VkColorBlendEquationEXT blendEquation{};
+		blendEquation.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+		blendEquation.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+		blendEquation.colorBlendOp = VK_BLEND_OP_ADD;
+		blendEquation.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+		blendEquation.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+		blendEquation.alphaBlendOp = VK_BLEND_OP_ADD;
+		vkCmdSetColorBlendEquationEXT( aCmd, 0, 1, &blendEquation );
+
+		VkColorComponentFlags const colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+		vkCmdSetColorWriteMaskEXT( aCmd, 0, 1, &colorWriteMask );
+
+		// Bind the linked vertex + fragment shader objects.
+		VkShaderStageFlagBits stages[] = { VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT };
+		VkShaderEXT shaders[] = { aResources.vertexShader.handle, aResources.fragmentShader.handle };
+		vkCmdBindShadersEXT( aCmd, 2, stages, shaders );
+
+		// Bind the per-frame UBO (descriptor set 0) through the pipeline layout.
+		vkCmdBindDescriptorSets( aCmd, VK_PIPELINE_BIND_POINT_GRAPHICS, aResources.pipelineLayout.handle, 0, 1, &aResources.uboSet, 0, nullptr );
+
+		// Draw every mesh with its own vertex + index buffers (indexed drawing).
+		VkDeviceSize offset = 0;
+		for( auto const& mesh : aResources.meshes )
+		{
+			vkCmdBindVertexBuffers( aCmd, 0, 1, &mesh.vertexBuffer.buffer, &offset );
+			vkCmdBindIndexBuffer( aCmd, mesh.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32 );
+			vkCmdDrawIndexed( aCmd, mesh.indexCount, 1, 0, 0, 0 );
+		}
+
 		vkCmdEndRendering( aCmd );
 
 		transition_image_layout(
@@ -143,6 +396,64 @@ namespace
 		throw_if_failed( vkEndCommandBuffer( aCmd ), "vkEndCommandBuffer()" );
 	}
 
+	// Creates (or recreates) the depth image + view for the current swapchain
+	// extent. The depth attachment must be recreated whenever the window resizes.
+	void create_depth_resources( lut::VulkanWindow const& aWindow, lut::Allocator const& aAllocator, VkCommandPool aCmdPool, lut::Image& aImage, lut::ImageView& aView )
+	{
+		VkFormat const format = VK_FORMAT_D32_SFLOAT;
+
+		VkImageCreateInfo imageInfo{};
+		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imageInfo.imageType = VK_IMAGE_TYPE_2D;
+		imageInfo.format = format;
+		imageInfo.extent.width = aWindow.swapchainExtent.width;
+		imageInfo.extent.height = aWindow.swapchainExtent.height;
+		imageInfo.extent.depth = 1;
+		imageInfo.mipLevels = 1;
+		imageInfo.arrayLayers = 1;
+		imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+		imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+		VmaAllocationCreateInfo allocInfo{};
+		allocInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+
+		VkImage image = VK_NULL_HANDLE;
+		VmaAllocation allocation = VK_NULL_HANDLE;
+		throw_if_failed( vmaCreateImage( aAllocator.allocator, &imageInfo, &allocInfo, &image, &allocation, nullptr ), "vmaCreateImage()" );
+		aImage = lut::Image( aAllocator.allocator, image, allocation );
+
+		VkImageViewCreateInfo viewInfo{};
+		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		viewInfo.image = image;
+		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		viewInfo.format = format;
+		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+		viewInfo.subresourceRange.levelCount = 1;
+		viewInfo.subresourceRange.layerCount = 1;
+
+		VkImageView view = VK_NULL_HANDLE;
+		throw_if_failed( vkCreateImageView( aWindow.device, &viewInfo, nullptr, &view ), "vkCreateImageView()" );
+		aView = lut::ImageView( aWindow.device, view );
+
+		// UNDEFINED -> DEPTH_STENCIL_ATTACHMENT_OPTIMAL (one-time).
+		submit_one_time( aWindow, aCmdPool, [&]( VkCommandBuffer aCmd )
+		{
+			transition_image_layout(
+				aCmd,
+				image,
+				VK_IMAGE_LAYOUT_UNDEFINED,
+				VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+				VK_PIPELINE_STAGE_2_NONE,
+				VK_ACCESS_2_NONE,
+				VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+				VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+				VK_IMAGE_ASPECT_DEPTH_BIT
+			);
+		} );
+	}
+
 	void reset_swapchain_frame_resources( lut::VulkanWindow const& aWindow, std::vector<VkImageLayout>& aLayouts, std::vector<lut::Semaphore>& aRenderFinished )
 	{
 		aLayouts.assign( aWindow.swapImages.size(), VK_IMAGE_LAYOUT_UNDEFINED );
@@ -152,7 +463,7 @@ namespace
 			aRenderFinished.emplace_back( lut::create_semaphore( aWindow.device ) );
 	}
 
-	void draw_frame( lut::VulkanWindow& aWindow, VkCommandBuffer aCmd, lut::Semaphore const& aImageAvailable, std::vector<lut::Semaphore>& aRenderFinished, lut::Fence const& aInFlight, std::vector<VkImageLayout>& aSwapImageLayouts, bool& aFramebufferResized )
+	void draw_frame( lut::VulkanWindow& aWindow, VkCommandBuffer aCmd, SceneResources& aResources, lut::Allocator const& aAllocator, VkCommandPool aCmdPool, lut::Semaphore const& aImageAvailable, std::vector<lut::Semaphore>& aRenderFinished, lut::Fence const& aInFlight, std::vector<VkImageLayout>& aSwapImageLayouts, bool& aFramebufferResized )
 	{
 		throw_if_failed( vkWaitForFences( aWindow.device, 1, &aInFlight.handle, VK_TRUE, kFenceTimeout ), "vkWaitForFences()" );
 
@@ -161,6 +472,7 @@ namespace
 		if( VK_ERROR_OUT_OF_DATE_KHR == acquireRes )
 		{
 			lut::recreate_swapchain( aWindow );
+			create_depth_resources( aWindow, aAllocator, aCmdPool, aResources.depthImage, aResources.depthView );
 			reset_swapchain_frame_resources( aWindow, aSwapImageLayouts, aRenderFinished );
 			return;
 		}
@@ -169,7 +481,7 @@ namespace
 			throw lut::Error( "vkAcquireNextImageKHR() returned {}", lut::to_string(acquireRes) );
 
 		throw_if_failed( vkResetFences( aWindow.device, 1, &aInFlight.handle ), "vkResetFences()" );
-		record_clear_commands( aWindow, aCmd, imageIndex, aSwapImageLayouts[imageIndex] );
+		record_draw_commands( aWindow, aCmd, imageIndex, aSwapImageLayouts[imageIndex], aResources );
 		aSwapImageLayouts[imageIndex] = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
 		VkSemaphoreSubmitInfo waitInfo{};
@@ -210,6 +522,7 @@ namespace
 		{
 			aFramebufferResized = false;
 			lut::recreate_swapchain( aWindow );
+			create_depth_resources( aWindow, aAllocator, aCmdPool, aResources.depthImage, aResources.depthView );
 			reset_swapchain_frame_resources( aWindow, aSwapImageLayouts, aRenderFinished );
 		}
 		else if( VK_SUCCESS != presentRes )
@@ -230,11 +543,152 @@ int main() try
 	glfwSetWindowUserPointer( window.window, &framebufferResized );
 	glfwSetFramebufferSizeCallback( window.window, framebuffer_resized_callback );
 
+	auto allocator = lut::create_allocator( window );
+
 	auto commandPool = lut::create_command_pool( window, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT );
 	auto commandBuffer = lut::alloc_command_buffer( window, commandPool.handle );
 
 	auto imageAvailable = lut::create_semaphore( window.device );
 	auto inFlight = lut::create_fence( window.device, VK_FENCE_CREATE_SIGNALED_BIT );
+
+	// --- Stage 1: load the baked model + textures, upload to GPU ---
+
+	// 1) Load the model produced by the a12-bake tool.
+	auto model = load_baked_model( "assets/a12/suntemple202526.comp5892mesh" );
+	std::print( "Loaded model: {} meshes, {} materials, {} textures\n", model.meshes.size(), model.materials.size(), model.textures.size() );
+
+	SceneResources resources;
+
+	// 2) Upload each mesh: interleave the baked arrays into one Vertex array,
+	//    then upload vertex + index buffers through a staging buffer.
+	for( auto const& mesh : model.meshes )
+	{
+		std::vector<Vertex> vertices;
+		vertices.reserve( mesh.positions.size() );
+		for( std::size_t i = 0; i < mesh.positions.size(); ++i )
+			vertices.push_back( Vertex{ mesh.positions[i], mesh.normals[i], mesh.texcoords[i] } );
+
+		MeshResources mr;
+		mr.vertexBuffer = upload_buffer( window, allocator, commandPool.handle, vertices.data(), vertices.size()*sizeof(Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT );
+		mr.indexBuffer = upload_buffer( window, allocator, commandPool.handle, mesh.indices.data(), mesh.indices.size()*sizeof(std::uint32_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT );
+		mr.indexCount = std::uint32_t( mesh.indices.size() );
+		mr.materialId = mesh.materialId;
+		resources.meshes.emplace_back( std::move(mr) );
+	}
+	std::print( "Uploaded {} meshes ({} total vertices)\n", resources.meshes.size(), model.meshes.size() );
+
+	// 3) Load every texture into GPU memory (they get bound in the next stage).
+	for( auto const& tex : model.textures )
+	{
+		resources.textures.emplace_back( lut::load_image_texture2d( tex.path.c_str(), window, commandPool.handle, allocator ) );
+	}
+	std::print( "Loaded {} textures\n", resources.textures.size() );
+
+	// 4) Aim a static camera at the scene using the model's bounding box, so
+	//    the model is visible without any user input yet.
+	glm::vec3 aabbMin( std::numeric_limits<float>::max() );
+	glm::vec3 aabbMax( std::numeric_limits<float>::lowest() );
+	for( auto const& mesh : model.meshes )
+		for( auto const& p : mesh.positions )
+		{
+			aabbMin = glm::min( aabbMin, p );
+			aabbMax = glm::max( aabbMax, p );
+		}
+
+	glm::vec3 const center = (aabbMin + aabbMax) * 0.5f;
+	float const radius = glm::length( aabbMax - aabbMin ) * 0.5f;
+	float const fov = glm::radians( 60.f );
+	float const distance = radius / std::tan( fov * 0.5f ) * 1.6f;
+	float const aspect = float(window.swapchainExtent.width) / float(window.swapchainExtent.height);
+
+	glm::mat4 const view = glm::lookAt( center + glm::vec3( 0.f, radius*0.5f, distance ), center, glm::vec3(0.f,1.f,0.f) );
+	glm::mat4 proj = glm::perspective( fov, aspect, 0.1f, distance + radius*4.f );
+	proj[1][1] *= -1.f; // Vulkan NDC has a flipped Y axis (see the "inverted triangle" discussion)
+
+	// 5) Per-frame UBO holding the view-projection matrix.
+	resources.uboBuffer = lut::create_buffer(
+		allocator,
+		sizeof(SceneUBO),
+		VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+		VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+		VMA_MEMORY_USAGE_AUTO
+	);
+	{
+		SceneUBO ubo{};
+		ubo.viewProj = proj * view;
+		void* data = nullptr;
+		throw_if_failed( vmaMapMemory( allocator.allocator, resources.uboBuffer.allocation, &data ), "vmaMapMemory()" );
+		std::memcpy( data, &ubo, sizeof(ubo) );
+		vmaUnmapMemory( allocator.allocator, resources.uboBuffer.allocation );
+		vmaFlushAllocation( allocator.allocator, resources.uboBuffer.allocation, 0, VK_WHOLE_SIZE );
+	}
+
+	// 6) Descriptor set (UBO) + pipeline layout.
+	VkDescriptorSetLayoutBinding uboBinding{};
+	uboBinding.binding = 0;
+	uboBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	uboBinding.descriptorCount = 1;
+	uboBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+	VkDescriptorSetLayoutCreateInfo layoutInfo{};
+	layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	layoutInfo.bindingCount = 1;
+	layoutInfo.pBindings = &uboBinding;
+
+	VkDescriptorSetLayout uboLayout = VK_NULL_HANDLE;
+	throw_if_failed( vkCreateDescriptorSetLayout( window.device, &layoutInfo, nullptr, &uboLayout ), "vkCreateDescriptorSetLayout()" );
+	resources.descriptorSetLayout = lut::DescriptorSetLayout( window.device, uboLayout );
+
+	VkDescriptorPoolSize poolSize{};
+	poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	poolSize.descriptorCount = 1;
+
+	VkDescriptorPoolCreateInfo poolInfo{};
+	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+	poolInfo.maxSets = 1;
+	poolInfo.poolSizeCount = 1;
+	poolInfo.pPoolSizes = &poolSize;
+
+	VkDescriptorPool pool = VK_NULL_HANDLE;
+	throw_if_failed( vkCreateDescriptorPool( window.device, &poolInfo, nullptr, &pool ), "vkCreateDescriptorPool()" );
+	resources.descriptorPool = lut::DescriptorPool( window.device, pool );
+
+	VkDescriptorSetAllocateInfo setAllocInfo{};
+	setAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	setAllocInfo.descriptorPool = pool;
+	setAllocInfo.descriptorSetCount = 1;
+	setAllocInfo.pSetLayouts = &uboLayout;
+	throw_if_failed( vkAllocateDescriptorSets( window.device, &setAllocInfo, &resources.uboSet ), "vkAllocateDescriptorSets()" );
+
+	VkDescriptorBufferInfo uboInfo{};
+	uboInfo.buffer = resources.uboBuffer.buffer;
+	uboInfo.range = sizeof(SceneUBO);
+
+	VkWriteDescriptorSet write{};
+	write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	write.dstSet = resources.uboSet;
+	write.dstBinding = 0;
+	write.descriptorCount = 1;
+	write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	write.pBufferInfo = &uboInfo;
+	vkUpdateDescriptorSets( window.device, 1, &write, 0, nullptr );
+
+	VkPipelineLayoutCreateInfo plInfo{};
+	plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	plInfo.setLayoutCount = 1;
+	plInfo.pSetLayouts = &uboLayout;
+
+	VkPipelineLayout pl = VK_NULL_HANDLE;
+	throw_if_failed( vkCreatePipelineLayout( window.device, &plInfo, nullptr, &pl ), "vkCreatePipelineLayout()" );
+	resources.pipelineLayout = lut::PipelineLayout( window.device, pl );
+
+	// 7) Load shaders and create the shader objects (vertex stage uses set 0).
+	auto const vertCode = lut::load_file_u32( "assets/a12/shaders/default.vert.spv" );
+	auto const fragCode = lut::load_file_u32( "assets/a12/shaders/default.frag.spv" );
+	create_shader_objects( window.device, vertCode, fragCode, uboLayout, resources );
+
+	// 8) Depth buffer sized to the swapchain.
+	create_depth_resources( window, allocator, commandPool.handle, resources.depthImage, resources.depthView );
 
 	std::vector<VkImageLayout> swapImageLayouts;
 	std::vector<lut::Semaphore> renderFinished;
@@ -243,7 +697,7 @@ int main() try
 	while( !glfwWindowShouldClose( window.window ) )
 	{
 		glfwPollEvents();
-		draw_frame( window, commandBuffer, imageAvailable, renderFinished, inFlight, swapImageLayouts, framebufferResized );
+		draw_frame( window, commandBuffer, resources, allocator, commandPool.handle, imageAvailable, renderFinished, inFlight, swapImageLayouts, framebufferResized );
 	}
 
 	throw_if_failed( vkDeviceWaitIdle( window.device ), "vkDeviceWaitIdle()" );

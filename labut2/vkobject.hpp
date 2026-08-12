@@ -99,6 +99,8 @@ namespace labut2
 
 	using ImageView = UniqueHandle< VkImageView, VkDevice, vkDestroyImageView >;
 	using Sampler = UniqueHandle< VkSampler, VkDevice, vkDestroySampler >;
+
+	using Shader = UniqueHandle< VkShaderEXT, VkDevice, vkDestroyShaderEXT >;
 }
 
 #include "vkobject.inl"

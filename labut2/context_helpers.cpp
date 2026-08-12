@@ -176,14 +176,18 @@ namespace labut2::detail
 	{
 		VkPhysicalDeviceVulkan13Features vk13{};
 		vk13.sType  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
-		
+
 		VkPhysicalDeviceVulkan14Features vk14{};
 		vk14.sType  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES;
 		vk14.pNext  = &vk13;
 
+		VkPhysicalDeviceShaderObjectFeaturesEXT shaderObject{};
+		shaderObject.sType  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT;
+		shaderObject.pNext  = &vk14;
+
 		VkPhysicalDeviceFeatures2 feat{};
 		feat.sType  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-		feat.pNext  = &vk14;
+		feat.pNext  = &shaderObject;
 
 		vkGetPhysicalDeviceFeatures2( aPhysicalDev, &feat );
 
@@ -199,6 +203,10 @@ namespace labut2::detail
 		if( !vk14.maintenance5 )
 		{
 			missingFeat.emplace_back( "maintenance5" );
+		}
+		if( !shaderObject.shaderObject )
+		{
+			missingFeat.emplace_back( "shaderObject" );
 		}
 
 		return missingFeat;

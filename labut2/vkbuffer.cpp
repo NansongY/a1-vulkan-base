@@ -48,6 +48,25 @@ namespace labut2
 {
 	Buffer create_buffer( Allocator const& aAllocator, VkDeviceSize aSize, VkBufferUsageFlags aBufferUsage, VmaAllocationCreateFlags aMemoryFlags, VmaMemoryUsage aMemoryUsage )
 	{
-		throw Error( "Not yet implemented" ); //TODO- implement me!
+		VkBufferCreateInfo bufferInfo{};
+		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+		bufferInfo.size = aSize;
+		bufferInfo.usage = aBufferUsage;
+		bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+		VmaAllocationCreateInfo allocInfo{};
+		allocInfo.flags = aMemoryFlags;
+		allocInfo.usage = aMemoryUsage;
+
+		VkBuffer buffer = VK_NULL_HANDLE;
+		VmaAllocation allocation = VK_NULL_HANDLE;
+		if( auto const res = vmaCreateBuffer( aAllocator.allocator, &bufferInfo, &allocInfo, &buffer, &allocation, nullptr ); VK_SUCCESS != res )
+		{
+			throw Error( "Unable to create buffer\n"
+				"vmaCreateBuffer() returned {}", to_string(res)
+			);
+		}
+
+		return Buffer( aAllocator.allocator, buffer, allocation );
 	}
 }

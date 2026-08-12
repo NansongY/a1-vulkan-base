@@ -217,6 +217,7 @@ namespace labut2
 		std::vector<char const*> enabledDevExensions;
 
 		enabledDevExensions.emplace_back( VK_KHR_SWAPCHAIN_EXTENSION_NAME );
+		enabledDevExensions.emplace_back( VK_EXT_SHADER_OBJECT_EXTENSION_NAME );
 
 		for( auto const& ext : enabledDevExensions )
 			std::print( stderr, "Enabling device extension: {}\n", ext );
@@ -612,6 +613,11 @@ namespace
 		vk14.pNext  = &vk13;
 		vk14.maintenance5  = VK_TRUE; // Required in Vulkan 1.4, but we need to say that we want it.
 
+		VkPhysicalDeviceShaderObjectFeaturesEXT shaderObject{};
+		shaderObject.sType  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT;
+		shaderObject.shaderObject  = VK_TRUE;
+		shaderObject.pNext  = &vk14;
+
 		VkDeviceCreateInfo deviceInfo{};
 		deviceInfo.sType  = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 
@@ -623,7 +629,7 @@ namespace
 
 		deviceInfo.pEnabledFeatures         = &deviceFeatures;
 
-		deviceInfo.pNext                    = &vk14;
+		deviceInfo.pNext                    = &shaderObject;
 
 		VkDevice device = VK_NULL_HANDLE;
 		if( auto const res = vkCreateDevice( aPhysicalDev, &deviceInfo, nullptr, &device ); VK_SUCCESS != res )
