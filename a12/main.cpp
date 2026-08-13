@@ -264,6 +264,7 @@ namespace
 		lut::Buffer indexBuffer;
 		std::uint32_t indexCount = 0;
 		std::uint32_t materialId = 0;
+		bool alphaMasked = false; // Task 1.6: material has an alpha mask
 	};
 
 	// Per-frame scene data passed to the vertex AND fragment shaders (Task 1.5
@@ -306,6 +307,7 @@ namespace
 
 		ShaderPair mainShaders;   // default.vert + default.frag (mode 1)
 		ShaderPair debugShaders;  // default.vert + debug.frag (modes 2..4)
+		ShaderPair alphaShaders;  // default.vert + alpha.frag (masked foliage, 1.6)
 	};
 
 	// Creates the vertex and fragment shader objects (VK_EXT_shader_object).
@@ -600,26 +602,45 @@ namespace
 		VkColorComponentFlags const colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
 		vkCmdSetColorWriteMaskEXT( aCmd, 0, 1, &colorWriteMask );
 
-		// Bind either the main or the debug (Task 1.4) shader pair.
-		ShaderPair const& pair = (aRenderMode > 1) ? aResources.debugShaders : aResources.mainShaders;
-		VkShaderStageFlagBits stages[] = { VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT };
-		VkShaderEXT shaders[] = { pair.vertex.handle, pair.fragment.handle };
-		vkCmdBindShadersEXT( aCmd, 2, stages, shaders );
-
-		// Bind the per-frame UBO (descriptor set 0) through the pipeline layout.
+		// Bind the per-frame UBO (descriptor set 0) through the pipeline layout
+		// (shared by every pass).
 		vkCmdBindDescriptorSets( aCmd, VK_PIPELINE_BIND_POINT_GRAPHICS, aResources.pipelineLayout.handle, 0, 1, &aResources.uboSet, 0, nullptr );
 
-		// Draw every mesh with its own vertex + index buffers (indexed drawing),
-		// binding the material's texture descriptor set (set 1) first.
+		VkShaderStageFlagBits stages[] = { VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT };
 		VkDeviceSize offset = 0;
-		for( auto const& mesh : aResources.meshes )
-		{
-			VkDescriptorSet const materialSet = aResources.materialSets[mesh.materialId];
-			vkCmdBindDescriptorSets( aCmd, VK_PIPELINE_BIND_POINT_GRAPHICS, aResources.pipelineLayout.handle, 1, 1, &materialSet, 0, nullptr );
 
-			vkCmdBindVertexBuffers( aCmd, 0, 1, &mesh.vertexBuffer.buffer, &offset );
-			vkCmdBindIndexBuffer( aCmd, mesh.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32 );
-			vkCmdDrawIndexed( aCmd, mesh.indexCount, 1, 0, 0, 0 );
+		// Draw the meshes for which aPredicate is true, using the given shader
+		// pair and binding each mesh's material descriptor set (set 1).
+		auto const drawMeshes = [&]( ShaderPair const& aPair, auto const& aPredicate )
+		{
+			VkShaderEXT shaders[] = { aPair.vertex.handle, aPair.fragment.handle };
+			vkCmdBindShadersEXT( aCmd, 2, stages, shaders );
+
+			for( auto const& mesh : aResources.meshes )
+			{
+				if( !aPredicate( mesh ) )
+					continue;
+
+				VkDescriptorSet const materialSet = aResources.materialSets[mesh.materialId];
+				vkCmdBindDescriptorSets( aCmd, VK_PIPELINE_BIND_POINT_GRAPHICS, aResources.pipelineLayout.handle, 1, 1, &materialSet, 0, nullptr );
+
+				vkCmdBindVertexBuffers( aCmd, 0, 1, &mesh.vertexBuffer.buffer, &offset );
+				vkCmdBindIndexBuffer( aCmd, mesh.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32 );
+				vkCmdDrawIndexed( aCmd, mesh.indexCount, 1, 0, 0, 0 );
+			}
+		};
+
+		if( aRenderMode > 1 )
+		{
+			// Debug visualization modes: draw everything with the debug pair.
+			drawMeshes( aResources.debugShaders, []( MeshResources const& ){ return true; } );
+		}
+		else
+		{
+			// Task 1.6: render ordinary (opaque) geometry first, then switch to
+			// the alpha-masked pipeline for foliage (alpha tested, two-sided).
+			drawMeshes( aResources.mainShaders,  []( MeshResources const& aMesh ){ return !aMesh.alphaMasked; } );
+			drawMeshes( aResources.alphaShaders, []( MeshResources const& aMesh ){ return  aMesh.alphaMasked; } );
 		}
 
 		vkCmdEndRendering( aCmd );
@@ -846,9 +867,14 @@ int main() try
 		mr.indexBuffer = upload_buffer( window, allocator, commandPool.handle, mesh.indices.data(), mesh.indices.size()*sizeof(std::uint32_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT );
 		mr.indexCount = std::uint32_t( mesh.indices.size() );
 		mr.materialId = mesh.materialId;
+		// Task 1.6: mark meshes whose material has an alpha mask
+		// (alphaMaskTextureId == 0xffffffff means "no alpha mask").
+		mr.alphaMasked = (0xffffffffu != model.materials[mesh.materialId].alphaMaskTextureId);
 		resources.meshes.emplace_back( std::move(mr) );
 	}
-	std::print( "Uploaded {} meshes ({} total vertices)\n", resources.meshes.size(), model.meshes.size() );
+	std::size_t const maskedCount = std::count_if( resources.meshes.begin(), resources.meshes.end(),
+		[]( MeshResources const& aMesh ){ return aMesh.alphaMasked; } );
+	std::print( "Uploaded {} meshes ({} alpha-masked, {} total vertices)\n", resources.meshes.size(), maskedCount, model.meshes.size() );
 
 	// 3) Load every texture into GPU memory (with a full mip chain) and create
 	//    a matching image view for each. sRGB textures get an sRGB format so
@@ -1045,6 +1071,12 @@ int main() try
 	auto const vertCode = lut::load_file_u32( "assets/a12/shaders/default.vert.spv" );
 	auto const fragCode = lut::load_file_u32( "assets/a12/shaders/default.frag.spv" );
 	resources.mainShaders = create_shader_pair( window.device, vertCode, fragCode, uboLayout, matLayout );
+
+	// Task 1.6: a third pair for alpha-masked foliage (same vertex shader,
+	// separate alpha.frag that discards fragments based on the base color's
+	// alpha channel).
+	auto const alphaFragCode = lut::load_file_u32( "assets/a12/shaders/alpha.frag.spv" );
+	resources.alphaShaders = create_shader_pair( window.device, vertCode, alphaFragCode, uboLayout, matLayout );
 
 	// Task 1.4: a second, independent shader pair for debug visualization
 	// (same vertex shader, separate debug.frag -- not part of the main shader).
