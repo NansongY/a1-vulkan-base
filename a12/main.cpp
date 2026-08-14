@@ -101,6 +101,7 @@ namespace
 		bool framebufferResized = false;
 		double lastFrameTime = 0.0;
 		int renderMode = 1; // 1 = default, 2..4 = debug visualizations
+		bool postMosaic = true; // Task 1.7: toggle the mosaic post-process effect
 	};
 
 	void framebuffer_resized_callback( GLFWwindow* aWindow, int, int )
@@ -137,6 +138,11 @@ namespace
 			case GLFW_KEY_1: case GLFW_KEY_2: case GLFW_KEY_3: case GLFW_KEY_4:
 				if( pressed )
 					app->renderMode = aKey - GLFW_KEY_1 + 1;
+				break;
+			// Task 1.7: M toggles the mosaic post-process effect.
+			case GLFW_KEY_M:
+				if( GLFW_PRESS == aAction )
+					app->postMosaic = !app->postMosaic;
 				break;
 			default: break;
 		}
@@ -308,6 +314,14 @@ namespace
 		ShaderPair mainShaders;   // default.vert + default.frag (mode 1)
 		ShaderPair debugShaders;  // default.vert + debug.frag (modes 2..4)
 		ShaderPair alphaShaders;  // default.vert + alpha.frag (masked foliage, 1.6)
+		ShaderPair postShaders;   // fullscreen.vert + post.frag (Task 1.7)
+
+		// Task 1.7: intermediate scene-color texture + post-process pipeline.
+		lut::Image sceneImage;
+		lut::ImageView sceneView;
+		lut::DescriptorSetLayout postSetLayout; // post set 0: scene color sampler
+		VkDescriptorSet postSet = VK_NULL_HANDLE;
+		lut::PipelineLayout postPipelineLayout; // with a mosaic-toggle push constant
 	};
 
 	// Creates the vertex and fragment shader objects (VK_EXT_shader_object).
@@ -316,13 +330,11 @@ namespace
 	// Note: this bundled header is VK_EXT_shader_object spec version 1, where
 	// vertex-input and color-blend state are NOT part of VkShaderCreateInfoEXT
 	// -- they are dynamic state that we set per command buffer instead.
-	// aSet0/aSet1 are the two descriptor set layouts used by the shaders
-	// (set 0 = UBO, set 1 = material texture). Both stages must be created
-	// with identical set-layout arrays (VUID-vkCmdDrawIndexed-None-08879).
-	ShaderPair create_shader_pair( VkDevice aDevice, std::vector<std::uint32_t> const& aVertCode, std::vector<std::uint32_t> const& aFragCode, VkDescriptorSetLayout aSet0, VkDescriptorSetLayout aSet1 )
+	// aSetLayouts are the descriptor set layouts used by the shaders (both
+	// stages must be created with identical set-layout arrays,
+	// VUID-vkCmdDrawIndexed-None-08879).
+	ShaderPair create_shader_pair( VkDevice aDevice, std::vector<std::uint32_t> const& aVertCode, std::vector<std::uint32_t> const& aFragCode, std::vector<VkDescriptorSetLayout> const& aSetLayouts )
 	{
-		VkDescriptorSetLayout const setLayouts[2] = { aSet0, aSet1 };
-
 		VkShaderCreateInfoEXT infos[2]{};
 
 		infos[0].sType  = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT;
@@ -333,8 +345,8 @@ namespace
 		infos[0].codeSize = aVertCode.size() * sizeof(std::uint32_t);
 		infos[0].pCode = aVertCode.data();
 		infos[0].pName = "main";
-		infos[0].setLayoutCount = 2;
-		infos[0].pSetLayouts = setLayouts;
+		infos[0].setLayoutCount = std::uint32_t( aSetLayouts.size() );
+		infos[0].pSetLayouts = aSetLayouts.data();
 
 		infos[1].sType  = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT;
 		infos[1].flags  = VK_SHADER_CREATE_LINK_STAGE_BIT_EXT;
@@ -344,8 +356,8 @@ namespace
 		infos[1].codeSize = aFragCode.size() * sizeof(std::uint32_t);
 		infos[1].pCode = aFragCode.data();
 		infos[1].pName = "main";
-		infos[1].setLayoutCount = 2; // must match the vertex stage's set layouts
-		infos[1].pSetLayouts = setLayouts;
+		infos[1].setLayoutCount = std::uint32_t( aSetLayouts.size() );
+		infos[1].pSetLayouts = aSetLayouts.data();
 
 		VkShaderEXT shaders[2]{};
 		throw_if_failed( vkCreateShadersEXT( aDevice, 2, infos, nullptr, shaders ), "vkCreateShadersEXT()" );
@@ -468,7 +480,8 @@ namespace
 		return deviceBuffer;
 	}
 
-	void record_draw_commands( lut::VulkanWindow const& aWindow, VkCommandBuffer aCmd, std::uint32_t aImageIndex, VkImageLayout aOldLayout, SceneResources const& aResources, int aRenderMode )
+	// Task 1.7: render the 3D scene into the intermediate color texture (Pass A).
+	void record_scene_pass( lut::VulkanWindow const& aWindow, VkCommandBuffer aCmd, SceneResources const& aResources, int aRenderMode )
 	{
 		throw_if_failed( vkResetCommandBuffer( aCmd, 0 ), "vkResetCommandBuffer()" );
 
@@ -477,13 +490,15 @@ namespace
 		beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 		throw_if_failed( vkBeginCommandBuffer( aCmd, &beginInfo ), "vkBeginCommandBuffer()" );
 
+		// The intermediate texture is in SHADER_READ_ONLY_OPTIMAL here (sampled
+		// by the previous frame's post pass); make it writable for rendering.
 		transition_image_layout(
 			aCmd,
-			aWindow.swapImages[aImageIndex],
-			aOldLayout,
+			aResources.sceneImage.image,
+			VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 			VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-			VK_PIPELINE_STAGE_2_NONE,
-			VK_ACCESS_2_NONE,
+			VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+			VK_ACCESS_2_SHADER_READ_BIT,
 			VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
 			VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT
 		);
@@ -496,7 +511,7 @@ namespace
 
 		VkRenderingAttachmentInfo colorAttachment{};
 		colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-		colorAttachment.imageView = aWindow.swapViews[aImageIndex];
+		colorAttachment.imageView = aResources.sceneView.handle;
 		colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 		colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
 		colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -645,6 +660,68 @@ namespace
 
 		vkCmdEndRendering( aCmd );
 
+		// Make the intermediate texture readable again for the post pass.
+		transition_image_layout(
+			aCmd,
+			aResources.sceneImage.image,
+			VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+			VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+			VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+			VK_ACCESS_2_SHADER_READ_BIT
+		);
+	}
+
+	// Task 1.7: post-process the intermediate texture and draw the result to the
+	// swapchain image (Pass B). Ends the command buffer.
+	void record_post_pass( lut::VulkanWindow const& aWindow, VkCommandBuffer aCmd, std::uint32_t aImageIndex, VkImageLayout aOldLayout, SceneResources const& aResources, bool aMosaicOn )
+	{
+		transition_image_layout(
+			aCmd,
+			aWindow.swapImages[aImageIndex],
+			aOldLayout,
+			VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			VK_PIPELINE_STAGE_2_NONE,
+			VK_ACCESS_2_NONE,
+			VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+			VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT
+		);
+
+		VkRenderingAttachmentInfo colorAttachment{};
+		colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+		colorAttachment.imageView = aWindow.swapViews[aImageIndex];
+		colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+		colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+		VkRenderingInfo renderingInfo{};
+		renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+		renderingInfo.renderArea.offset = { 0, 0 };
+		renderingInfo.renderArea.extent = aWindow.swapchainExtent;
+		renderingInfo.layerCount = 1;
+		renderingInfo.colorAttachmentCount = 1;
+		renderingInfo.pColorAttachments = &colorAttachment;
+		renderingInfo.pDepthAttachment = nullptr; // post pass needs no depth
+
+		vkCmdBeginRendering( aCmd, &renderingInfo );
+
+		// The fullscreen triangle needs no vertex attributes (gl_VertexIndex only).
+		vkCmdSetVertexInputEXT( aCmd, 0, nullptr, 0, nullptr );
+
+		VkShaderStageFlagBits stages[] = { VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT };
+		VkShaderEXT shaders[] = { aResources.postShaders.vertex.handle, aResources.postShaders.fragment.handle };
+		vkCmdBindShadersEXT( aCmd, 2, stages, shaders );
+
+		vkCmdBindDescriptorSets( aCmd, VK_PIPELINE_BIND_POINT_GRAPHICS, aResources.postPipelineLayout.handle, 0, 1, &aResources.postSet, 0, nullptr );
+
+		std::uint32_t const mosaicOn = aMosaicOn ? 1u : 0u;
+		vkCmdPushConstants( aCmd, aResources.postPipelineLayout.handle, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(mosaicOn), &mosaicOn );
+
+		vkCmdDraw( aCmd, 3, 1, 0, 0 );
+
+		vkCmdEndRendering( aCmd );
+
 		transition_image_layout(
 			aCmd,
 			aWindow.swapImages[aImageIndex],
@@ -717,6 +794,65 @@ namespace
 		} );
 	}
 
+	// Creates (or recreates) the intermediate scene-color texture + view used by
+	// the post-process pass (Task 1.7). Recreated on resize, like the depth buffer.
+	void create_scene_color_resources( lut::VulkanWindow const& aWindow, lut::Allocator const& aAllocator, VkCommandPool aCmdPool, lut::Image& aImage, lut::ImageView& aView )
+	{
+		VkFormat const format = aWindow.swapchainFormat;
+
+		VkImageCreateInfo imageInfo{};
+		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imageInfo.imageType = VK_IMAGE_TYPE_2D;
+		imageInfo.format = format;
+		imageInfo.extent.width = aWindow.swapchainExtent.width;
+		imageInfo.extent.height = aWindow.swapchainExtent.height;
+		imageInfo.extent.depth = 1;
+		imageInfo.mipLevels = 1;
+		imageInfo.arrayLayers = 1;
+		imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+		imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+		VmaAllocationCreateInfo allocInfo{};
+		allocInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+
+		VkImage image = VK_NULL_HANDLE;
+		VmaAllocation allocation = VK_NULL_HANDLE;
+		throw_if_failed( vmaCreateImage( aAllocator.allocator, &imageInfo, &allocInfo, &image, &allocation, nullptr ), "vmaCreateImage()" );
+		aImage = lut::Image( aAllocator.allocator, image, allocation );
+
+		VkImageViewCreateInfo viewInfo{};
+		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		viewInfo.image = image;
+		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		viewInfo.format = format;
+		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		viewInfo.subresourceRange.levelCount = 1;
+		viewInfo.subresourceRange.layerCount = 1;
+
+		VkImageView view = VK_NULL_HANDLE;
+		throw_if_failed( vkCreateImageView( aWindow.device, &viewInfo, nullptr, &view ), "vkCreateImageView()" );
+		aView = lut::ImageView( aWindow.device, view );
+
+		// One-time UNDEFINED -> SHADER_READ_ONLY_OPTIMAL. After this, the texture
+		// alternates SHADER_READ <-> COLOR_ATTACHMENT every frame (Pass A writes,
+		// Pass B samples), so no extra layout tracking is needed.
+		submit_one_time( aWindow, aCmdPool, [&]( VkCommandBuffer aCmd )
+		{
+			transition_image_layout(
+				aCmd,
+				image,
+				VK_IMAGE_LAYOUT_UNDEFINED,
+				VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				VK_PIPELINE_STAGE_2_NONE,
+				VK_ACCESS_2_NONE,
+				VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+				VK_ACCESS_2_SHADER_READ_BIT
+			);
+		} );
+	}
+
 	void reset_swapchain_frame_resources( lut::VulkanWindow const& aWindow, std::vector<VkImageLayout>& aLayouts, std::vector<lut::Semaphore>& aRenderFinished )
 	{
 		aLayouts.assign( aWindow.swapImages.size(), VK_IMAGE_LAYOUT_UNDEFINED );
@@ -736,6 +872,7 @@ namespace
 		{
 			lut::recreate_swapchain( aWindow );
 			create_depth_resources( aWindow, aAllocator, aCmdPool, aResources.depthImage, aResources.depthView );
+			create_scene_color_resources( aWindow, aAllocator, aCmdPool, aResources.sceneImage, aResources.sceneView );
 			reset_swapchain_frame_resources( aWindow, aSwapImageLayouts, aRenderFinished );
 			return;
 		}
@@ -769,7 +906,8 @@ namespace
 			vmaFlushAllocation( aAllocator.allocator, aResources.uboBuffer.allocation, 0, VK_WHOLE_SIZE );
 		}
 
-		record_draw_commands( aWindow, aCmd, imageIndex, aSwapImageLayouts[imageIndex], aResources, aAppState.renderMode );
+		record_scene_pass( aWindow, aCmd, aResources, aAppState.renderMode );
+		record_post_pass( aWindow, aCmd, imageIndex, aSwapImageLayouts[imageIndex], aResources, aAppState.postMosaic );
 		aSwapImageLayouts[imageIndex] = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
 		VkSemaphoreSubmitInfo waitInfo{};
@@ -811,6 +949,7 @@ namespace
 			aAppState.framebufferResized = false;
 			lut::recreate_swapchain( aWindow );
 			create_depth_resources( aWindow, aAllocator, aCmdPool, aResources.depthImage, aResources.depthView );
+			create_scene_color_resources( aWindow, aAllocator, aCmdPool, aResources.sceneImage, aResources.sceneView );
 			reset_swapchain_frame_resources( aWindow, aSwapImageLayouts, aRenderFinished );
 		}
 		else if( VK_SUCCESS != presentRes )
@@ -977,11 +1116,11 @@ int main() try
 	poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
 	poolSizes[0].descriptorCount = 1;
 	poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	poolSizes[1].descriptorCount = 3 * materialCount; // baseColor + roughness + metalness
+	poolSizes[1].descriptorCount = 3 * materialCount + 1; // materials + post-process
 
 	VkDescriptorPoolCreateInfo poolInfo{};
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-	poolInfo.maxSets = 1 + materialCount;
+	poolInfo.maxSets = 2 + materialCount; // UBO + post-process + one per material
 	poolInfo.poolSizeCount = 2;
 	poolInfo.pPoolSizes = poolSizes;
 
@@ -1070,21 +1209,80 @@ int main() try
 	// 7) Load shaders and create the shader pairs (set 0 = UBO, set 1 = texture).
 	auto const vertCode = lut::load_file_u32( "assets/a12/shaders/default.vert.spv" );
 	auto const fragCode = lut::load_file_u32( "assets/a12/shaders/default.frag.spv" );
-	resources.mainShaders = create_shader_pair( window.device, vertCode, fragCode, uboLayout, matLayout );
+	resources.mainShaders = create_shader_pair( window.device, vertCode, fragCode, { uboLayout, matLayout } );
 
 	// Task 1.6: a third pair for alpha-masked foliage (same vertex shader,
 	// separate alpha.frag that discards fragments based on the base color's
 	// alpha channel).
 	auto const alphaFragCode = lut::load_file_u32( "assets/a12/shaders/alpha.frag.spv" );
-	resources.alphaShaders = create_shader_pair( window.device, vertCode, alphaFragCode, uboLayout, matLayout );
+	resources.alphaShaders = create_shader_pair( window.device, vertCode, alphaFragCode, { uboLayout, matLayout } );
 
 	// Task 1.4: a second, independent shader pair for debug visualization
 	// (same vertex shader, separate debug.frag -- not part of the main shader).
 	auto const debugFragCode = lut::load_file_u32( "assets/a12/shaders/debug.frag.spv" );
-	resources.debugShaders = create_shader_pair( window.device, vertCode, debugFragCode, uboLayout, matLayout );
+	resources.debugShaders = create_shader_pair( window.device, vertCode, debugFragCode, { uboLayout, matLayout } );
 
 	// 8) Depth buffer sized to the swapchain.
 	create_depth_resources( window, allocator, commandPool.handle, resources.depthImage, resources.depthView );
+
+	// 9) Task 1.7: intermediate scene-color texture + post-process resources.
+	create_scene_color_resources( window, allocator, commandPool.handle, resources.sceneImage, resources.sceneView );
+
+	VkDescriptorSetLayoutBinding postBinding{};
+	postBinding.binding = 0;
+	postBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	postBinding.descriptorCount = 1;
+	postBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+	VkDescriptorSetLayoutCreateInfo postLayoutInfo{};
+	postLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+	postLayoutInfo.bindingCount = 1;
+	postLayoutInfo.pBindings = &postBinding;
+
+	VkDescriptorSetLayout postLayout = VK_NULL_HANDLE;
+	throw_if_failed( vkCreateDescriptorSetLayout( window.device, &postLayoutInfo, nullptr, &postLayout ), "vkCreateDescriptorSetLayout()" );
+	resources.postSetLayout = lut::DescriptorSetLayout( window.device, postLayout );
+
+	VkDescriptorSetAllocateInfo postAllocInfo{};
+	postAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+	postAllocInfo.descriptorPool = pool;
+	postAllocInfo.descriptorSetCount = 1;
+	postAllocInfo.pSetLayouts = &postLayout;
+	throw_if_failed( vkAllocateDescriptorSets( window.device, &postAllocInfo, &resources.postSet ), "vkAllocateDescriptorSets()" );
+
+	VkDescriptorImageInfo postImgInfo{};
+	postImgInfo.sampler = resources.sampler.handle;
+	postImgInfo.imageView = resources.sceneView.handle;
+	postImgInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+	VkWriteDescriptorSet postWrite{};
+	postWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	postWrite.dstSet = resources.postSet;
+	postWrite.dstBinding = 0;
+	postWrite.descriptorCount = 1;
+	postWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	postWrite.pImageInfo = &postImgInfo;
+	vkUpdateDescriptorSets( window.device, 1, &postWrite, 0, nullptr );
+
+	VkPushConstantRange pcRange{};
+	pcRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+	pcRange.offset = 0;
+	pcRange.size = sizeof( std::uint32_t );
+
+	VkPipelineLayoutCreateInfo postPlInfo{};
+	postPlInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+	postPlInfo.setLayoutCount = 1;
+	postPlInfo.pSetLayouts = &postLayout;
+	postPlInfo.pushConstantRangeCount = 1;
+	postPlInfo.pPushConstantRanges = &pcRange;
+
+	VkPipelineLayout postPl = VK_NULL_HANDLE;
+	throw_if_failed( vkCreatePipelineLayout( window.device, &postPlInfo, nullptr, &postPl ), "vkCreatePipelineLayout()" );
+	resources.postPipelineLayout = lut::PipelineLayout( window.device, postPl );
+
+	auto const postVertCode = lut::load_file_u32( "assets/a12/shaders/fullscreen.vert.spv" );
+	auto const postFragCode = lut::load_file_u32( "assets/a12/shaders/post.frag.spv" );
+	resources.postShaders = create_shader_pair( window.device, postVertCode, postFragCode, { postLayout } );
 
 	std::vector<VkImageLayout> swapImageLayouts;
 	std::vector<lut::Semaphore> renderFinished;
